@@ -14,8 +14,6 @@ find_package(Threads REQUIRED)
 
 add_library(mcpserverlib SHARED
   mcpserverlib_global.h
-  mcpserverlib.cpp
-  mcpserverlib.h
   mcpcommand.h
   mcpcommandregistry.h mcpcommandregistry.cpp
   mcpserver.h mcpserver.cpp

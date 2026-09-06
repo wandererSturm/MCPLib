@@ -8,9 +8,6 @@
 #include "mcpcommand.h"
 #include "mcpserverlib_global.h"
 
-// Thread-safe: executeCommand() is called from worker threads (see McpServer),
-// while addCommand()/removeCommand() are typically called from the app's main
-// thread, so access to the command map is mutex-guarded.
 class MCPSERVERLIB_EXPORT McpCommandRegistry : public QObject {
     Q_OBJECT
 

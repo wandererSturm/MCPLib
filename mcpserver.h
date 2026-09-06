@@ -32,13 +32,8 @@ private:
     void startStdinReader();
     void handleLine(const QByteArray &line);
 
-    // Synchronous requests only (initialize, tools/list, unknown method).
-    // tools/call is dispatched separately via callToolAsync() so a slow tool
-    // never blocks the thread that received the request.
     void handleRequest(const QJsonObject &req, const SendFn &sendFn);
 
-    // Runs the tool on m_toolThreadPool. Result is an empty QJsonObject for
-    // notifications (nothing to send back), otherwise a full JSON-RPC response.
     QFuture<QJsonObject> callToolAsync(const QJsonObject &req);
 
     void writeStdioMessage(const QJsonObject &msg);
