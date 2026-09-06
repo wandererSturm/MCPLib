@@ -1,4 +1,5 @@
 #include "cancommands.h"
+#include "udsutil.h"
 #include <QCanBus>
 #include <QJsonArray>
 #include <QJsonDocument>
@@ -6,45 +7,6 @@
 #include <QTimer>
 #include <QDeadlineTimer>
 #include <utility>
-
-static QJsonObject textResult(const QString &text, bool isError = false) {
-    QJsonObject obj{{"content", QJsonArray{QJsonObject{{"type", "text"}, {"text", text}}}}};
-    if (isError) obj["isError"] = true;
-    return obj;
-}
-
-static quint32 parseCanId(const QJsonValue &v) {
-    if (v.isString()) {
-        QString s = v.toString();
-        bool hex = s.startsWith("0x") || s.startsWith("0X");
-        return s.toUInt(nullptr, hex ? 16 : 10);
-    }
-    return static_cast<quint32>(v.toInt());
-}
-
-static QString hexBytes(const QByteArray &data) {
-    QStringList parts;
-    for (unsigned char b : data) parts << QString("%1").arg(b, 2, 16, QChar('0'));
-    return parts.join(' ');
-}
-
-static QString nrcName(quint8 nrc) {
-    switch (nrc) {
-        case 0x10: return "generalReject";
-        case 0x11: return "serviceNotSupported";
-        case 0x12: return "subFunctionNotSupported";
-        case 0x13: return "incorrectMessageLengthOrInvalidFormat";
-        case 0x22: return "conditionsNotCorrect";
-        case 0x24: return "requestSequenceError";
-        case 0x31: return "requestOutOfRange";
-        case 0x33: return "securityAccessDenied";
-        case 0x35: return "invalidKey";
-        case 0x36: return "exceedNumberOfAttempts";
-        case 0x37: return "requiredTimeDelayNotExpired";
-        case 0x78: return "responsePending";
-        default: return "unknown";
-    }
-}
 
 CanManager::CanManager(QObject *parent) : QObject(parent) {}
 
@@ -195,7 +157,7 @@ QJsonObject CanManager::listInterfaces(const QString &plugin) {
             for (const auto &info : infos) names << info.name();
             lines << QString("%1: %2").arg(p, names.isEmpty() ? (err.isEmpty() ? "none" : "error: " + err) : names.join(", "));
         }
-        return textResult(lines.join(" | "));
+        return udsTextResult(lines.join(" | "));
     });
 }
 
@@ -205,13 +167,13 @@ QJsonObject CanManager::open(const QString &plugin, const QString &interfaceName
         QString err;
         QCanBusDevice *newDevice = QCanBus::instance()->createDevice(plugin, interfaceName, &err);
         if (!newDevice)
-            return textResult("failed to open " + plugin + ":" + interfaceName + ": " + err, true);
+            return udsTextResult("failed to open " + plugin + ":" + interfaceName + ": " + err, true);
 
         connect(newDevice, &QCanBusDevice::framesReceived, this, &CanManager::onFramesReceived);
         if (!newDevice->connectDevice()) {
             QString e = newDevice->errorString();
             delete newDevice;
-            return textResult("failed to connect " + plugin + ":" + interfaceName + ": " + e, true);
+            return udsTextResult("failed to connect " + plugin + ":" + interfaceName + ": " + e, true);
         }
 
         if (m_device) {
@@ -223,7 +185,7 @@ QJsonObject CanManager::open(const QString &plugin, const QString &interfaceName
         m_forceExtendedId = forceExtendedId;
         m_extendedAddressing = extendedAddressing;
         m_addressExtension = addressExtension;
-        return textResult("opened " + interfaceName);
+        return udsTextResult("opened " + interfaceName);
     });
 }
 
@@ -234,12 +196,12 @@ QJsonObject CanManager::close() {
             t->deleteLater();
         }
         m_testerPresentTimers.clear();
-        if (!m_device) return textResult("already closed");
+        if (!m_device) return udsTextResult("already closed");
         m_device->disconnectDevice();
         delete m_device;
         m_device = nullptr;
         m_buffer.clear();
-        return textResult("closed");
+        return udsTextResult("closed");
     });
 }
 
@@ -251,38 +213,38 @@ QJsonObject CanManager::getReceivedFrames(int limit) {
             const auto &f = m_buffer.at(i);
             arr.append(QJsonObject{
                 {"id", QString("0x%1").arg(f.frameId(), 0, 16)},
-                {"data", hexBytes(f.payload())}
+                {"data", udsHexBytes(f.payload())}
             });
         }
         m_buffer.erase(m_buffer.begin(), m_buffer.begin() + n);
-        return textResult(QString::fromUtf8(QJsonDocument(arr).toJson(QJsonDocument::Compact)));
+        return udsTextResult(QString::fromUtf8(QJsonDocument(arr).toJson(QJsonDocument::Compact)));
     });
 }
 
 QJsonObject CanManager::sendUdsRequest(quint32 txId, quint32 rxId, const QByteArray &payload, int timeoutMs) {
     return onOwnThread([this, txId, rxId, payload, timeoutMs]() -> QJsonObject {
-        if (!m_device) return textResult("no CAN interface open", true);
+        if (!m_device) return udsTextResult("no CAN interface open", true);
         if (!sendIsoTp(txId, rxId, payload))
-            return textResult("failed to send request (no flow control from ECU)", true);
+            return udsTextResult("failed to send request (no flow control from ECU)", true);
 
         for (int attempt = 0; attempt < 10; ++attempt) {
             QByteArray resp = receiveIsoTp(txId, rxId, timeoutMs);
-            if (resp.isEmpty()) return textResult("timeout waiting for response", true);
+            if (resp.isEmpty()) return udsTextResult("timeout waiting for response", true);
             if (resp.size() >= 3 && static_cast<quint8>(resp[0]) == 0x7F) {
                 quint8 nrc = static_cast<quint8>(resp[2]);
                 if (nrc == 0x78) continue;
-                return textResult(QString("negative response: NRC 0x%1 (%2)")
-                    .arg(nrc, 2, 16, QChar('0')).arg(nrcName(nrc)), true);
+                return udsTextResult(QString("negative response: NRC 0x%1 (%2)")
+                    .arg(nrc, 2, 16, QChar('0')).arg(udsNrcName(nrc)), true);
             }
-            return textResult(hexBytes(resp));
+            return udsTextResult(udsHexBytes(resp));
         }
-        return textResult("ECU kept responding pending (0x78), gave up", true);
+        return udsTextResult("ECU kept responding pending (0x78), gave up", true);
     });
 }
 
 QJsonObject CanManager::testerPresentStart(quint32 id, int intervalMs, bool functional, bool suppressPositiveResponse) {
     return onOwnThread([this, id, intervalMs, functional, suppressPositiveResponse]() -> QJsonObject {
-        if (!m_device) return textResult("no CAN interface open", true);
+        if (!m_device) return udsTextResult("no CAN interface open", true);
         QString handle = QString("tp_%1").arg(++m_handleCounter);
         quint8 sub = (functional || suppressPositiveResponse) ? 0x80 : 0x00;
         auto *timer = new QTimer(this);
@@ -298,18 +260,18 @@ QJsonObject CanManager::testerPresentStart(quint32 id, int intervalMs, bool func
         });
         timer->start(intervalMs);
         m_testerPresentTimers.insert(handle, timer);
-        return textResult(handle);
+        return udsTextResult(handle);
     });
 }
 
 QJsonObject CanManager::testerPresentStop(const QString &handle) {
     return onOwnThread([this, handle]() -> QJsonObject {
         auto it = m_testerPresentTimers.find(handle);
-        if (it == m_testerPresentTimers.end()) return textResult("no such handle", true);
+        if (it == m_testerPresentTimers.end()) return udsTextResult("no such handle", true);
         it.value()->stop();
         it.value()->deleteLater();
         m_testerPresentTimers.erase(it);
-        return textResult("stopped");
+        return udsTextResult("stopped");
     });
 }
 
@@ -403,8 +365,8 @@ QJsonObject UdsSendRequestCommand::definition() const {
     };
 }
 QJsonObject UdsSendRequestCommand::execute(const QJsonObject &args) {
-    quint32 txId = parseCanId(args["txId"]);
-    quint32 rxId = parseCanId(args["rxId"]);
+    quint32 txId = udsParseId(args["txId"]);
+    quint32 rxId = udsParseId(args["rxId"]);
     QByteArray payload;
     for (const auto &v : args["data"].toArray()) payload.append(char(v.toInt()));
     int timeoutMs = args.contains("timeoutMs") ? args["timeoutMs"].toInt() : 1000;
@@ -428,7 +390,7 @@ QJsonObject UdsTesterPresentStartCommand::definition() const {
     };
 }
 QJsonObject UdsTesterPresentStartCommand::execute(const QJsonObject &args) {
-    quint32 id = parseCanId(args["id"]);
+    quint32 id = udsParseId(args["id"]);
     int intervalMs = args.contains("intervalMs") ? args["intervalMs"].toInt() : 2000;
     bool functional = args["addressing"].toString() == "functional";
     bool suppress = args.contains("suppressPositiveResponse") ? args["suppressPositiveResponse"].toBool() : true;

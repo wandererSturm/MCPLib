@@ -17,7 +17,10 @@ add_library(mcpserverlib SHARED
   mcpcommand.h
   mcpcommandregistry.h mcpcommandregistry.cpp
   mcpserver.h mcpserver.cpp
+  udsutil.h udsutil.cpp
   cancommands.h cancommands.cpp
+  doipcommands.h doipcommands.cpp
+  hsfzcommands.h hsfzcommands.cpp
 )
 
 target_include_directories(mcpserverlib PUBLIC
