@@ -12,8 +12,6 @@ McpServer::McpServer(McpCommandRegistry *registry, quint16 port, QObject *parent
 {
     m_toolThreadPool.setMaxThreadCount(qMax(1, QThread::idealThreadCount()));
 
-    // Streamable HTTP transport: a single POST endpoint. tools/call responses
-    // are QFuture-based so a slow tool never blocks QHttpServer's I/O thread.
     m_httpServer = new QHttpServer(this);
     m_httpServer->route("/mcp", QHttpServerRequest::Method::Post,
         [this](const QHttpServerRequest &request) -> QFuture<QHttpServerResponse> {
@@ -57,11 +55,6 @@ McpServer::McpServer(McpCommandRegistry *registry, quint16 port, QObject *parent
 }
 
 void McpServer::startStdinReader() {
-    // stdio transport: lets stdio-only MCP clients (Claude Code, Codex, OpenCode, ...)
-    // talk to this same process alongside the HTTP transport. Reading is done
-    // with a portable blocking loop (std::cin) on a dedicated thread rather than
-    // a POSIX fd notifier, so this works on Windows as well as Linux/macOS.
-    // The thread outlives the server (detached) - the OS reclaims it on process exit.
     std::thread([this]() {
         std::string line;
         while (std::getline(std::cin, line)) {
@@ -93,8 +86,6 @@ void McpServer::handleLine(const QByteArray &line) {
 }
 
 void McpServer::onRegistryChanged() {
-    // Server-initiated push - only deliverable to stdio clients, since the
-    // HTTP transport here has no open stream to send it over.
     writeStdioMessage(QJsonObject{
         {"jsonrpc", "2.0"},
         {"method", "notifications/tools/list_changed"}
@@ -102,7 +93,6 @@ void McpServer::onRegistryChanged() {
 }
 
 void McpServer::writeStdioMessage(const QJsonObject &msg) {
-    // Only valid MCP JSON-RPC messages may go to stdout; logging must use stderr.
     QByteArray out = QJsonDocument(msg).toJson(QJsonDocument::Compact);
     fwrite(out.constData(), 1, static_cast<size_t>(out.size()), stdout);
     fputc('\n', stdout);
@@ -151,8 +141,6 @@ void McpServer::handleRequest(const QJsonObject &req, const SendFn &sendFn) {
         return;
     }
 
-    // Notifications (no "id") never get a response, per JSON-RPC 2.0 -
-    // this also covers "notifications/initialized" without special-casing it.
     if (isNotification) return;
 
     sendFn(QJsonObject{
