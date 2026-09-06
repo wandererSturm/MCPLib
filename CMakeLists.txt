@@ -9,7 +9,7 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 
-find_package(Qt6 REQUIRED COMPONENTS Core Concurrent Network HttpServer)
+find_package(Qt6 REQUIRED COMPONENTS Core Concurrent Network HttpServer SerialBus)
 find_package(Threads REQUIRED)
 
 add_library(mcpserverlib SHARED
@@ -17,6 +17,7 @@ add_library(mcpserverlib SHARED
   mcpcommand.h
   mcpcommandregistry.h mcpcommandregistry.cpp
   mcpserver.h mcpserver.cpp
+  cancommands.h cancommands.cpp
 )
 
 target_include_directories(mcpserverlib PUBLIC
@@ -28,6 +29,7 @@ target_link_libraries(mcpserverlib PUBLIC
   Qt6::Concurrent
   Qt6::Network
   Qt6::HttpServer
+  Qt6::SerialBus
   Threads::Threads
 )
 
