@@ -5,6 +5,8 @@
 #include <QEventLoop>
 #include <QTimer>
 #include <QDeadlineTimer>
+#include <QNetworkInterface>
+#include <QHostAddress>
 #include <utility>
 
 static const quint8 HSFZ_TYPE_DIAG = 0x01;
@@ -61,6 +63,60 @@ HsfzManager::HsfzMsg HsfzManager::waitForMessage(int timeoutMs, const std::funct
         loop.exec();
     }
     return HsfzMsg{0, 0, 0, QByteArray()};
+}
+
+static QStringList localLinkLocalSubnetHosts() {
+    QStringList hosts;
+    for (const QHostAddress &addr : QNetworkInterface::allAddresses()) {
+        if (addr.protocol() != QAbstractSocket::IPv4Protocol) continue;
+        QString s = addr.toString();
+        if (!s.startsWith("169.254.")) continue;
+        QStringList parts = s.split('.');
+        QString prefix = parts[0] + "." + parts[1] + "." + parts[2] + ".";
+        for (int i = 1; i <= 254; ++i) {
+            QString candidate = prefix + QString::number(i);
+            if (candidate != s) hosts << candidate;
+        }
+    }
+    return hosts;
+}
+
+QJsonObject HsfzManager::discoverVehicles(const QStringList &hosts, quint16 port, int timeoutMs) {
+    return onOwnThread([this, hosts, port, timeoutMs]() -> QJsonObject {
+        QStringList candidates = hosts.isEmpty() ? localLinkLocalSubnetHosts() : hosts;
+        if (candidates.isEmpty())
+            return udsTextResult("no link-local (169.254.x.x) network interface found to scan; pass hosts explicitly", true);
+
+        QJsonArray found;
+        QEventLoop loop;
+        int pending = candidates.size();
+        QList<QTcpSocket *> sockets;
+
+        for (const QString &host : candidates) {
+            auto *sock = new QTcpSocket();
+            sockets << sock;
+            QObject::connect(sock, &QTcpSocket::connected, &loop, [sock, host, &found, &pending, &loop]() {
+                found.append(host);
+                sock->disconnectFromHost();
+                if (--pending == 0) loop.quit();
+            });
+            QObject::connect(sock, &QAbstractSocket::errorOccurred, &loop, [&pending, &loop](QAbstractSocket::SocketError) {
+                if (--pending == 0) loop.quit();
+            });
+            sock->connectToHost(host, port);
+        }
+
+        QTimer::singleShot(timeoutMs, &loop, &QEventLoop::quit);
+        loop.exec();
+
+        for (auto *sock : sockets) {
+            sock->abort();
+            sock->deleteLater();
+        }
+
+        return udsTextResult(found.isEmpty() ? "no HSFZ-capable hosts responded (best-effort connect-scan - HSFZ has no standardized discovery broadcast like DoIP)"
+            : QString::fromUtf8(QJsonDocument(found).toJson(QJsonDocument::Compact)));
+    });
 }
 
 QJsonObject HsfzManager::open(const QString &host, quint16 port, quint8 sourceAddress, int timeoutMs) {
@@ -291,4 +347,30 @@ QJsonObject HsfzTesterPresentStopCommand::definition() const {
 }
 QJsonObject HsfzTesterPresentStopCommand::execute(const QJsonObject &args) {
     return m_manager->testerPresentStop(args["handle"].toString());
+}
+
+QJsonObject HsfzDiscoverVehiclesCommand::definition() const {
+    return QJsonObject{
+        {"name", "hsfz_discover_vehicles"},
+        {"description", "Best-effort scan for HSFZ-capable hosts (BMW ENET/ICOM). Unlike DoIP, HSFZ has no standardized discovery broadcast, so this is a parallel TCP connect-scan, not a real vehicle announcement. If no hosts are given, it auto-scans the /24 around any local 169.254.x.x link-local interface (the typical ENET cable addressing)."},
+        {"inputSchema", QJsonObject{
+            {"type", "object"},
+            {"properties", QJsonObject{
+                {"hosts", QJsonObject{
+                    {"type", "array"},
+                    {"items", QJsonObject{{"type", "string"}}},
+                    {"description", "explicit list of IPs to probe; omit to auto-scan the local link-local subnet"}
+                }},
+                {"port", QJsonObject{{"type", "integer"}, {"description", "default 6801"}}},
+                {"timeoutMs", QJsonObject{{"type", "integer"}, {"description", "total scan time budget, default 1500"}}}
+            }}
+        }}
+    };
+}
+QJsonObject HsfzDiscoverVehiclesCommand::execute(const QJsonObject &args) {
+    QStringList hosts;
+    for (const auto &v : args["hosts"].toArray()) hosts << v.toString();
+    quint16 port = args.contains("port") ? static_cast<quint16>(args["port"].toInt()) : 6801;
+    int timeoutMs = args.contains("timeoutMs") ? args["timeoutMs"].toInt() : 1500;
+    return m_manager->discoverVehicles(hosts, port, timeoutMs);
 }

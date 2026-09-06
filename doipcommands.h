@@ -15,6 +15,7 @@ public:
     explicit DoipManager(QObject *parent = nullptr);
 
     QJsonObject open(const QString &host, quint16 port, quint16 sourceAddress, quint8 activationType, int timeoutMs);
+    QJsonObject discoverVehicles(const QString &broadcastAddress, int timeoutMs);
     QJsonObject close();
     QJsonObject getReceivedMessages(int limit);
     QJsonObject sendUdsRequest(quint16 targetAddress, const QByteArray &payload, int timeoutMs);
@@ -54,6 +55,13 @@ public:
     explicit DoipCommandBase(DoipManager *manager) : m_manager(manager) {}
 protected:
     DoipManager *m_manager;
+};
+
+class MCPSERVERLIB_EXPORT DoipDiscoverVehiclesCommand : public DoipCommandBase {
+public:
+    using DoipCommandBase::DoipCommandBase;
+    QJsonObject definition() const override;
+    QJsonObject execute(const QJsonObject &args) override;
 };
 
 class MCPSERVERLIB_EXPORT DoipOpenCommand : public DoipCommandBase {

@@ -5,6 +5,8 @@
 #include <QEventLoop>
 #include <QTimer>
 #include <QDeadlineTimer>
+#include <QUdpSocket>
+#include <QNetworkDatagram>
 #include <utility>
 
 DoipManager::DoipManager(QObject *parent) : QObject(parent) {}
@@ -57,6 +59,56 @@ DoipManager::DoipMsg DoipManager::waitForMessage(int timeoutMs, const std::funct
         loop.exec();
     }
     return DoipMsg{0, QByteArray()};
+}
+
+QJsonObject DoipManager::discoverVehicles(const QString &broadcastAddress, int timeoutMs) {
+    return onOwnThread([this, broadcastAddress, timeoutMs]() -> QJsonObject {
+        QUdpSocket udp;
+        if (!udp.bind(QHostAddress::AnyIPv4, 0))
+            return udsTextResult("failed to bind UDP socket: " + udp.errorString(), true);
+
+        QByteArray header(8, char(0));
+        header[0] = char(0x02);
+        header[1] = char(0xFD);
+        header[3] = char(0x01);
+        udp.writeDatagram(header, QHostAddress(broadcastAddress), 13400);
+
+        QJsonArray found;
+        QDeadlineTimer deadline(timeoutMs);
+        while (!deadline.hasExpired()) {
+            if (!udp.hasPendingDatagrams()) {
+                qint64 remaining = deadline.remainingTime();
+                if (remaining <= 0) break;
+                QEventLoop loop;
+                connect(&udp, &QUdpSocket::readyRead, &loop, &QEventLoop::quit);
+                QTimer::singleShot(int(remaining), &loop, &QEventLoop::quit);
+                loop.exec();
+                if (!udp.hasPendingDatagrams()) continue;
+            }
+
+            QNetworkDatagram dg = udp.receiveDatagram();
+            QByteArray data = dg.data();
+            if (data.size() < 8) continue;
+            quint16 type = (static_cast<quint8>(data[2]) << 8) | static_cast<quint8>(data[3]);
+            quint32 len = (static_cast<quint8>(data[4]) << 24) | (static_cast<quint8>(data[5]) << 16)
+                        | (static_cast<quint8>(data[6]) << 8) | static_cast<quint8>(data[7]);
+            QByteArray payload = data.mid(8, int(len));
+            if (type != 0x0004 || payload.size() < 32) continue;
+
+            QString vin = QString::fromLatin1(payload.mid(0, 17));
+            quint16 logicalAddr = (static_cast<quint8>(payload[17]) << 8) | static_cast<quint8>(payload[18]);
+            found.append(QJsonObject{
+                {"ip", dg.senderAddress().toString()},
+                {"vin", vin},
+                {"logicalAddress", QString("0x%1").arg(logicalAddr, 4, 16, QChar('0'))},
+                {"eid", udsHexBytes(payload.mid(19, 6))},
+                {"gid", udsHexBytes(payload.mid(25, 6))}
+            });
+        }
+
+        return udsTextResult(found.isEmpty() ? "no vehicles found"
+            : QString::fromUtf8(QJsonDocument(found).toJson(QJsonDocument::Compact)));
+    });
 }
 
 QJsonObject DoipManager::open(const QString &host, quint16 port, quint16 sourceAddress, quint8 activationType, int timeoutMs) {
@@ -311,4 +363,23 @@ QJsonObject DoipTesterPresentStopCommand::definition() const {
 }
 QJsonObject DoipTesterPresentStopCommand::execute(const QJsonObject &args) {
     return m_manager->testerPresentStop(args["handle"].toString());
+}
+
+QJsonObject DoipDiscoverVehiclesCommand::definition() const {
+    return QJsonObject{
+        {"name", "doip_discover_vehicles"},
+        {"description", "Broadcast an ISO 13400 Vehicle Identification Request over UDP and collect Vehicle Announcement responses. Standardized DoIP discovery - does not require an open TCP connection."},
+        {"inputSchema", QJsonObject{
+            {"type", "object"},
+            {"properties", QJsonObject{
+                {"broadcastAddress", QJsonObject{{"type", "string"}, {"description", "default 255.255.255.255"}}},
+                {"timeoutMs", QJsonObject{{"type", "integer"}, {"description", "how long to listen for responses, default 2000"}}}
+            }}
+        }}
+    };
+}
+QJsonObject DoipDiscoverVehiclesCommand::execute(const QJsonObject &args) {
+    QString broadcastAddress = args.contains("broadcastAddress") ? args["broadcastAddress"].toString() : "255.255.255.255";
+    int timeoutMs = args.contains("timeoutMs") ? args["timeoutMs"].toInt() : 2000;
+    return m_manager->discoverVehicles(broadcastAddress, timeoutMs);
 }

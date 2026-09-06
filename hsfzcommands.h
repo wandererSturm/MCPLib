@@ -5,6 +5,7 @@
 #include <QMap>
 #include <QTimer>
 #include <QThread>
+#include <QStringList>
 #include <functional>
 #include "mcpcommand.h"
 #include "mcpserverlib_global.h"
@@ -15,6 +16,7 @@ public:
     explicit HsfzManager(QObject *parent = nullptr);
 
     QJsonObject open(const QString &host, quint16 port, quint8 sourceAddress, int timeoutMs);
+    QJsonObject discoverVehicles(const QStringList &hosts, quint16 port, int timeoutMs);
     QJsonObject close();
     QJsonObject getReceivedMessages(int limit);
     QJsonObject sendUdsRequest(quint8 targetAddress, const QByteArray &payload, int timeoutMs);
@@ -54,6 +56,13 @@ public:
     explicit HsfzCommandBase(HsfzManager *manager) : m_manager(manager) {}
 protected:
     HsfzManager *m_manager;
+};
+
+class MCPSERVERLIB_EXPORT HsfzDiscoverVehiclesCommand : public HsfzCommandBase {
+public:
+    using HsfzCommandBase::HsfzCommandBase;
+    QJsonObject definition() const override;
+    QJsonObject execute(const QJsonObject &args) override;
 };
 
 class MCPSERVERLIB_EXPORT HsfzOpenCommand : public HsfzCommandBase {
