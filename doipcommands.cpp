@@ -250,15 +250,15 @@ QJsonObject DoipManager::testerPresentStop(const QString &handle) {
 QJsonObject DoipOpenCommand::definition() const {
     return QJsonObject{
         {"name", "doip_open"},
-        {"description", "Connect to a vehicle over DoIP (ISO 13400, diagnostics over Ethernet/TCP) and perform routing activation"},
+        {"description", "Step 1 (or 2, after doip_discover_vehicles) of the DoIP workflow: opens a TCP connection to a vehicle's DoIP gateway (ISO 13400, diagnostics over Ethernet) and performs routing activation, which is required before any diagnostic traffic will be accepted. Only one connection can be open at a time; calling this again replaces it. After this succeeds, use doip_send_request to talk to an ECU by its logical address - you do not need to build or parse raw DoIP messages yourself. Full workflow: doip_discover_vehicles (optional, to find the gateway IP) -> doip_open (once) -> any number of doip_send_request / doip_tester_present_start+stop calls -> doip_close when done."},
         {"inputSchema", QJsonObject{
             {"type", "object"},
             {"properties", QJsonObject{
-                {"host", QJsonObject{{"type", "string"}, {"description", "gateway IP address or hostname"}}},
-                {"port", QJsonObject{{"type", "integer"}, {"description", "default 13400"}}},
-                {"sourceAddress", QJsonObject{{"type", "string"}, {"description", "tester's own logical address, default 0x0E00"}}},
-                {"activationType", QJsonObject{{"type", "integer"}, {"description", "default 0x00 (default activation)"}}},
-                {"timeoutMs", QJsonObject{{"type", "integer"}, {"description", "default 2000"}}}
+                {"host", QJsonObject{{"type", "string"}, {"description", "the DoIP gateway's IP address or hostname (not an individual ECU's address - the gateway routes to ECUs by logical address once connected). Get this from doip_discover_vehicles if unknown."}}},
+                {"port", QJsonObject{{"type", "integer"}, {"description", "default 13400 (standard DoIP port)"}}},
+                {"sourceAddress", QJsonObject{{"type", "string"}, {"description", "this tester's own logical address, as a hex string like \"0x0E00\" or a decimal number. Default 0x0E00. Rarely needs changing unless the vehicle/tool requires a specific registered tester address."}}},
+                {"activationType", QJsonObject{{"type", "integer"}, {"description", "DoIP routing activation type, default 0x00 (default/normal activation). Some vehicles require a different value (e.g. 0x01/0x02/0xE0 for manufacturer-specific central-security or WWH-OBD activation) - consult the vehicle's DoIP spec if 0x00 is refused."}}},
+                {"timeoutMs", QJsonObject{{"type", "integer"}, {"description", "connection + routing-activation timeout, default 2000ms"}}}
             }},
             {"required", QJsonArray{"host"}}
         }}
@@ -275,7 +275,7 @@ QJsonObject DoipOpenCommand::execute(const QJsonObject &args) {
 QJsonObject DoipCloseCommand::definition() const {
     return QJsonObject{
         {"name", "doip_close"},
-        {"description", "Close the current DoIP connection"},
+        {"description", "Close the current DoIP TCP connection and stop any running doip_tester_present_start timers. Safe to call even if nothing is open."},
         {"inputSchema", QJsonObject{{"type", "object"}}}
     };
 }
@@ -286,7 +286,7 @@ QJsonObject DoipCloseCommand::execute(const QJsonObject &) {
 QJsonObject DoipGetReceivedMessagesCommand::definition() const {
     return QJsonObject{
         {"name", "doip_get_received_messages"},
-        {"description", "Drain buffered raw DoIP messages received since the last call"},
+        {"description", "Debugging/inspection tool only - drains up to 500 buffered raw DoIP messages seen since the last call. You do NOT need this for normal request/response diagnostics: doip_send_request already returns the decoded UDS payload directly. Use this to investigate unexpected traffic or connection issues."},
         {"inputSchema", QJsonObject{
             {"type", "object"},
             {"properties", QJsonObject{
@@ -302,17 +302,17 @@ QJsonObject DoipGetReceivedMessagesCommand::execute(const QJsonObject &args) {
 QJsonObject DoipSendRequestCommand::definition() const {
     return QJsonObject{
         {"name", "doip_send_request"},
-        {"description", "Send a UDS request over an open DoIP connection and return the decoded response"},
+        {"description", "Requires doip_open to have succeeded first. Sends one UDS (ISO 14229) diagnostic request to a specific ECU over the open DoIP connection and blocks until the full response arrives or timeoutMs elapses, returning the decoded UDS payload as a space-separated hex string (e.g. '62 f1 90 ...'), NOT a raw DoIP message. ECU 'response pending' (NRC 0x78) is automatically waited out and retried internally. A negative response (0x7F ...) is returned as an error result naming the NRC, not as raw bytes. One call = one request/response pair; call it again for each subsequent request (e.g. session control, then security access, then the actual read/write service)."},
         {"inputSchema", QJsonObject{
             {"type", "object"},
             {"properties", QJsonObject{
-                {"targetAddress", QJsonObject{{"type", "string"}, {"description", "ECU's logical address, e.g. 0x0010"}}},
+                {"targetAddress", QJsonObject{{"type", "string"}, {"description", "the target ECU's DoIP logical address (16-bit), e.g. \"0x0010\" (hex string with 0x prefix) or a plain decimal number. This is per-ECU, unlike the connection's gateway host - the same open connection can address different ECUs by changing this on each call."}}},
                 {"data", QJsonObject{
                     {"type", "array"},
                     {"items", QJsonObject{{"type", "integer"}}},
-                    {"description", "SID plus payload bytes, e.g. [34, 241, 144] for ReadDataByIdentifier"}
+                    {"description", "The raw UDS request bytes as plain decimal integers 0-255 (NOT hex strings) - the first byte is the Service ID (SID). E.g. [16, 3] = DiagnosticSessionControl(0x10) to extendedDiagnosticSession(0x03); [34, 241, 144] = ReadDataByIdentifier(0x22) of DID 0xF190 (VIN)."}
                 }},
-                {"timeoutMs", QJsonObject{{"type", "integer"}, {"description", "default 2000"}}}
+                {"timeoutMs", QJsonObject{{"type", "integer"}, {"description", "how long to wait for the complete response, default 2000ms"}}}
             }},
             {"required", QJsonArray{"targetAddress", "data"}}
         }}
@@ -329,11 +329,11 @@ QJsonObject DoipSendRequestCommand::execute(const QJsonObject &args) {
 QJsonObject DoipTesterPresentStartCommand::definition() const {
     return QJsonObject{
         {"name", "doip_tester_present_start"},
-        {"description", "Start sending periodic UDS TesterPresent (0x3E) over DoIP to keep a diagnostic session alive"},
+        {"description", "Requires doip_open to have succeeded first. Starts a background timer that periodically sends UDS TesterPresent (0x3E) fire-and-forget (it does NOT wait for or return the ECU's response). Use this to keep a non-default diagnostic session (e.g. extendedDiagnosticSession) from timing out while you do other work; not required for simple one-off requests in the default session. Returns a handle immediately - call doip_tester_present_stop with that handle when done, and before doip_close if you want to stop it explicitly (it's also auto-stopped on doip_close)."},
         {"inputSchema", QJsonObject{
             {"type", "object"},
             {"properties", QJsonObject{
-                {"targetAddress", QJsonObject{{"type", "string"}, {"description", "ECU's logical address, e.g. 0x0010"}}},
+                {"targetAddress", QJsonObject{{"type", "string"}, {"description", "ECU's logical address, e.g. 0x0010 (same address you use in doip_send_request)"}}},
                 {"intervalMs", QJsonObject{{"type", "integer"}, {"description", "default 2000, keep below the ECU's S3 timeout (usually 5000ms)"}}},
                 {"suppressPositiveResponse", QJsonObject{{"type", "boolean"}, {"description", "default true"}}}
             }},
@@ -368,7 +368,7 @@ QJsonObject DoipTesterPresentStopCommand::execute(const QJsonObject &args) {
 QJsonObject DoipDiscoverVehiclesCommand::definition() const {
     return QJsonObject{
         {"name", "doip_discover_vehicles"},
-        {"description", "Broadcast an ISO 13400 Vehicle Identification Request over UDP and collect Vehicle Announcement responses. Standardized DoIP discovery - does not require an open TCP connection."},
+        {"description", "Optional first step of the DoIP workflow, only needed when you don't already know the gateway's IP address. Broadcasts an ISO 13400 Vehicle Identification Request over UDP and collects Vehicle Announcement responses (VIN, logical address, IP). Standardized DoIP discovery - does not require doip_open first. Use the returned 'ip' field as the host argument to doip_open."},
         {"inputSchema", QJsonObject{
             {"type", "object"},
             {"properties", QJsonObject{

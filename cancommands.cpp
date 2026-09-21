@@ -347,7 +347,7 @@ QJsonObject CanManager::testerPresentStop(const QString &handle) {
 QJsonObject CanListInterfacesCommand::definition() const {
     return QJsonObject{
         {"name", "can_list_interfaces"},
-        {"description", "Discover which CAN backend plugins and interfaces actually exist on this machine. Call this with no arguments before can_open - plugin/interface names are platform- and install-dependent, so treat this as the source of truth rather than guessing names."},
+        {"description", "Step 1 of the CAN workflow: discover which CAN backend plugins and interfaces actually exist on this machine. Call this with no arguments before can_open - plugin/interface names are platform- and install-dependent, so treat this as the source of truth rather than guessing names. Full workflow: can_list_interfaces (once) -> can_open (once) -> any number of uds_send_request / uds_tester_present_start+stop calls -> can_close when done. Only one interface can be open at a time; can_open on a new interface replaces the current one."},
         {"inputSchema", QJsonObject{
             {"type", "object"},
             {"properties", QJsonObject{
@@ -363,18 +363,18 @@ QJsonObject CanListInterfacesCommand::execute(const QJsonObject &args) {
 QJsonObject CanOpenCommand::definition() const {
     return QJsonObject{
         {"name", "can_open"},
-        {"description", "Open a CAN interface on a given backend plugin. Call can_list_interfaces first (with no arguments) to see which plugins and interfaces actually exist on this machine - plugin availability and driver support vary by OS and by what's installed, so don't guess a plugin name from memory."},
+        {"description", "Step 2 of the CAN workflow: open a CAN interface on a given backend plugin. Call can_list_interfaces first (with no arguments) to see which plugins and interfaces actually exist on this machine - plugin availability and driver support vary by OS and by what's installed, so don't guess a plugin name from memory. After this succeeds, use uds_send_request to talk to an ECU; you do not need to build or parse raw CAN/ISO-TP frames yourself (single-frame vs multi-frame segmentation and flow control are handled internally). Wrong bitrate is the most common failure mode and looks like 'nothing on the bus' or garbage repeating frames on a fixed ID like 0x8 - if requests time out with zero received traffic, suspect the bitrate before suspecting addressing."},
         {"inputSchema", QJsonObject{
             {"type", "object"},
             {"properties", QJsonObject{
                 {"plugin", QJsonObject{{"type", "string"}, {"description", "backend plugin name as returned by can_list_interfaces, e.g. socketcan, socketcanfd, peakcan, tinycan, passthrucan, virtualcan, gsusb"}}},
                 {"interface", QJsonObject{{"type", "string"}, {"description", "an interface name as returned by can_list_interfaces for the chosen plugin"}}},
-                {"paddingByte", QJsonObject{{"type", "integer"}, {"description", "byte used to pad ISO-TP frames to 8 bytes, default 0x00, common alternatives 0xAA/0xCC"}}},
-                {"extendedId", QJsonObject{{"type", "boolean"}, {"description", "force 29-bit extended CAN IDs; IDs above 0x7FF already get this automatically, so this is only needed to force it for a smaller ID"}}},
-                {"extendedAddressing", QJsonObject{{"type", "boolean"}, {"description", "ISO-TP extended addressing: prepend addressExtension as an address-extension byte before the PCI byte on every frame"}}},
-                {"addressExtension", QJsonObject{{"type", "integer"}, {"description", "address-extension byte value, only used when extendedAddressing is true"}}},
-                {"fd", QJsonObject{{"type", "boolean"}, {"description", "enable CAN FD (up to 64-byte frames), e.g. for a gs_usb/candleLight-class adapter (socketcan/socketcanfd on Linux, gsusb on Windows). Default false (classic CAN, 8-byte frames)"}}},
-                {"bitrate", QJsonObject{{"type", "integer"}, {"description", "nominal (arbitration phase) bitrate in bit/s, e.g. 500000. Omit to use the interface's configured default"}}},
+                {"paddingByte", QJsonObject{{"type", "integer"}, {"description", "byte used to pad ISO-TP frames to 8 bytes, default 0x00, common alternatives 0xAA/0xCC. Most UDS/diagnostic ECUs expect frames padded to a full 8 bytes - leave this at default unless you know the vehicle uses unpadded/variable-length frames"}}},
+                {"extendedId", QJsonObject{{"type", "boolean"}, {"description", "force 29-bit extended CAN IDs; IDs above 0x7FF already get this automatically, so this is only needed to force it for a smaller ID. Most vehicle diagnostic buses use plain 11-bit (standard) IDs - leave this false unless told otherwise"}}},
+                {"extendedAddressing", QJsonObject{{"type", "boolean"}, {"description", "Enables ISO-TP 'extended addressing': prepends addressExtension as an extra address byte on every frame, used to select which ECU a message is for when multiple ECUs share the same CAN ID (common on some manufacturer-specific buses, e.g. several BMW modules answering different physical addresses on one shared tester-request ID). This is NOT the same as 29-bit extended CAN IDs (see extendedId) and is NOT needed for standard OBD-II/UDS addressing where each ECU has its own distinct request/response CAN ID pair (e.g. 0x7E0/0x7E8) - in that far more common case, leave this false and just set distinct txId/rxId per ECU in uds_send_request. Only enable this when a vehicle-specific diagnostic spec explicitly calls for a target-address byte."}}},
+                {"addressExtension", QJsonObject{{"type", "integer"}, {"description", "The address-extension/target-address byte value prepended to every frame, only used when extendedAddressing is true. This is a vehicle- and ECU-specific value from the diagnostic addressing table (e.g. 0x40) - it is applied the same way to both the request you send and expected in frames the ECU sends back."}}},
+                {"fd", QJsonObject{{"type", "boolean"}, {"description", "enable CAN FD (up to 64-byte frames), e.g. for a gs_usb/candleLight-class adapter (socketcan/socketcanfd on Linux, gsusb on Windows). Default false (classic CAN, 8-byte frames). Most legacy vehicle diagnostic buses are classic CAN - only set this true if you know the specific bus/ECU supports CAN FD."}}},
+                {"bitrate", QJsonObject{{"type", "integer"}, {"description", "nominal (arbitration phase) bitrate in bit/s. Common vehicle values: 500000 (typical powertrain/diagnostic CAN) or 125000/100000 (typical lower-speed body/comfort CAN). Omitting this uses the interface's configured default, which for most adapters is NOT the vehicle's actual bitrate - if you don't already know the bus speed, ask the user rather than guessing, since a wrong value produces bit errors/garbage traffic that looks like a dead bus, not a clean timeout."}}},
                 {"dataBitrate", QJsonObject{{"type", "integer"}, {"description", "CAN FD data-phase bitrate in bit/s, e.g. 2000000. Only used when fd is true"}}},
                 {"bitrateSwitch", QJsonObject{{"type", "boolean"}, {"description", "use bit-rate switching (BRS) for the data phase of FD frames. Default true when fd is true and dataBitrate is set"}}}
             }},
@@ -398,7 +398,7 @@ QJsonObject CanOpenCommand::execute(const QJsonObject &args) {
 QJsonObject CanCloseCommand::definition() const {
     return QJsonObject{
         {"name", "can_close"},
-        {"description", "Close the currently open CAN interface"},
+        {"description", "Close the currently open CAN interface and stop any running uds_tester_present_start timers. Safe to call even if nothing is open. Not required before can_open with a different interface (can_open replaces the current one automatically), but call it when you're done with the whole session."},
         {"inputSchema", QJsonObject{{"type", "object"}}}
     };
 }
@@ -409,7 +409,7 @@ QJsonObject CanCloseCommand::execute(const QJsonObject &) {
 QJsonObject CanGetReceivedFramesCommand::definition() const {
     return QJsonObject{
         {"name", "can_get_received_frames"},
-        {"description", "Drain buffered raw CAN frames received since the last call"},
+        {"description", "Debugging/inspection tool only - drains up to 500 buffered raw CAN frames (all traffic seen on the bus since the last call, not just responses to your requests). You do NOT need this for normal request/response diagnostics: uds_send_request already handles frame assembly, ISO-TP flow control, and reassembly of multi-frame responses internally and returns the decoded UDS payload directly. Use this tool when a request is timing out and you need to check whether the bus has any traffic at all (bitrate/wiring sanity check) or to observe periodic non-diagnostic traffic."},
         {"inputSchema", QJsonObject{
             {"type", "object"},
             {"properties", QJsonObject{
@@ -425,18 +425,18 @@ QJsonObject CanGetReceivedFramesCommand::execute(const QJsonObject &args) {
 QJsonObject UdsSendRequestCommand::definition() const {
     return QJsonObject{
         {"name", "uds_send_request"},
-        {"description", "Send a UDS request over ISO-TP and return the decoded response"},
+        {"description", "Requires can_open to have succeeded first. Sends one UDS (ISO 14229) diagnostic request over ISO-TP (ISO 15765-2) and blocks until the full response arrives or timeoutMs elapses, returning the decoded UDS payload as a space-separated hex string (e.g. '62 f1 90 ...'), NOT raw CAN frames. Multi-frame requests/responses (payloads longer than one CAN frame), flow control, and ECU 'response pending' (NRC 0x78, which this call automatically waits out and retries on) are all handled internally - you never construct First/Consecutive/Flow-Control frames yourself. A negative response (0x7F ...) is returned as an error result naming the NRC, not as raw bytes. One call = one request/response pair; call it again for each subsequent request (e.g. session control, then security access, then the actual read/write service)."},
         {"inputSchema", QJsonObject{
             {"type", "object"},
             {"properties", QJsonObject{
-                {"txId", QJsonObject{{"type", "string"}, {"description", "request CAN ID, e.g. 0x7E0"}}},
-                {"rxId", QJsonObject{{"type", "string"}, {"description", "response CAN ID, e.g. 0x7E8"}}},
+                {"txId", QJsonObject{{"type", "string"}, {"description", "CAN ID this tester sends the request on (the ECU's physical request/'listen' ID), e.g. \"0x7E0\" (hex string with 0x prefix) or a plain decimal number. Must match the txId/rxId pair configured for can_open's addressing mode."}}},
+                {"rxId", QJsonObject{{"type", "string"}, {"description", "CAN ID the ECU's response is expected on, e.g. \"0x7E8\". Same format as txId."}}},
                 {"data", QJsonObject{
                     {"type", "array"},
                     {"items", QJsonObject{{"type", "integer"}}},
-                    {"description", "SID plus payload bytes, e.g. [34, 241, 144] for ReadDataByIdentifier"}
+                    {"description", "The raw UDS request bytes as plain decimal integers 0-255 (NOT hex strings) - the first byte is the Service ID (SID). E.g. [16, 3] = DiagnosticSessionControl(0x10) to extendedDiagnosticSession(0x03); [34, 241, 144] = ReadDataByIdentifier(0x22) of DID 0xF190 (VIN). Do not include any ISO-TP framing/length bytes - just the UDS service payload."}
                 }},
-                {"timeoutMs", QJsonObject{{"type", "integer"}}}
+                {"timeoutMs", QJsonObject{{"type", "integer"}, {"description", "how long to wait for the complete response, default 1000ms. Increase for slow services (e.g. routine control, flashing-related requests, or ECUs known to respond slowly)."}}}
             }},
             {"required", QJsonArray{"txId", "rxId", "data"}}
         }}
@@ -454,11 +454,11 @@ QJsonObject UdsSendRequestCommand::execute(const QJsonObject &args) {
 QJsonObject UdsTesterPresentStartCommand::definition() const {
     return QJsonObject{
         {"name", "uds_tester_present_start"},
-        {"description", "Start sending periodic UDS TesterPresent (0x3E) to keep a diagnostic session alive"},
+        {"description", "Requires can_open to have succeeded first. Starts a background timer that periodically sends UDS TesterPresent (0x3E) fire-and-forget (it does NOT wait for or return the ECU's response - use uds_send_request separately if you need to inspect it). Use this to keep a non-default diagnostic session (e.g. extendedDiagnosticSession) from timing out while you do other work between uds_send_request calls; it is NOT required for simple one-off requests in the default session. Returns a handle immediately - call uds_tester_present_stop with that handle when done, and always before can_close (open timers are also auto-stopped on can_close, but stop them explicitly once you no longer need the session kept alive)."},
         {"inputSchema", QJsonObject{
             {"type", "object"},
             {"properties", QJsonObject{
-                {"id", QJsonObject{{"type", "string"}, {"description", "CAN ID to send on: the ECU's physical request ID for addressing=physical, or the vehicle's broadcast ID (e.g. 0x7DF) for addressing=functional"}}},
+                {"id", QJsonObject{{"type", "string"}, {"description", "CAN ID to send on: the ECU's physical request ID (same as txId you used in uds_send_request) for addressing=physical, or the vehicle's broadcast ID (e.g. 0x7DF) for addressing=functional"}}},
                 {"addressing", QJsonObject{{"type", "string"}, {"enum", QJsonArray{"physical", "functional"}}, {"description", "default physical. functional always suppresses the response regardless of suppressPositiveResponse"}}},
                 {"intervalMs", QJsonObject{{"type", "integer"}, {"description", "default 2000, keep below the ECU's S3 timeout (usually 5000ms)"}}},
                 {"suppressPositiveResponse", QJsonObject{{"type", "boolean"}, {"description", "default true, ignored (always true) when addressing=functional"}}}
