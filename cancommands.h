@@ -17,7 +17,8 @@ public:
 
     QJsonObject listInterfaces(const QString &plugin);
     QJsonObject open(const QString &plugin, const QString &interfaceName, quint8 padByte, bool forceExtendedId,
-                      bool extendedAddressing, quint8 addressExtension);
+                      bool extendedAddressing, quint8 addressExtension, bool fdMode, quint32 bitrate,
+                      quint32 dataBitrate, bool bitrateSwitch);
     QJsonObject close();
     QJsonObject getReceivedFrames(int limit);
     QJsonObject sendUdsRequest(quint32 txId, quint32 rxId, const QByteArray &payload, int timeoutMs);
@@ -49,6 +50,8 @@ private:
     bool m_forceExtendedId = false;
     bool m_extendedAddressing = false;
     quint8 m_addressExtension = 0x00;
+    bool m_fdMode = false;
+    bool m_fdBitrateSwitch = false;
     QList<QCanBusFrame> m_buffer;
     QMap<QString, QTimer *> m_testerPresentTimers;
     int m_handleCounter = 0;

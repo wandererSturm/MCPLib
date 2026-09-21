@@ -7,6 +7,9 @@
 #include <QTimer>
 #include <QDeadlineTimer>
 #include <utility>
+#ifdef MCPSERVERLIB_HAVE_GSUSB
+#include "gsusbcanbus.h"
+#endif
 
 CanManager::CanManager(QObject *parent) : QObject(parent) {}
 
@@ -39,7 +42,18 @@ void CanManager::sendRaw(quint32 id, const QByteArray &data) {
     if (!m_device) return;
     QCanBusFrame frame(id, data);
     if (m_forceExtendedId) frame.setExtendedFrameFormat(true);
+    if (m_fdMode) {
+        frame.setFlexibleDataRateFormat(true);
+        if (m_fdBitrateSwitch) frame.setBitrateSwitch(true);
+    }
     m_device->writeFrame(frame);
+}
+
+// Valid CAN FD payload lengths (ISO 11898-1); classic CAN only ever uses 8.
+static int fdFrameSizeFor(int totalLen) {
+    static const int sizes[] = {8, 12, 16, 20, 24, 32, 48, 64};
+    for (int s : sizes) if (totalLen <= s) return s;
+    return 64;
 }
 
 static int pciTypeAt(const QByteArray &d, int ae) {
@@ -49,8 +63,10 @@ static int pciTypeAt(const QByteArray &d, int ae) {
 
 bool CanManager::sendIsoTp(quint32 txId, quint32 rxId, const QByteArray &payload) {
     int ae = m_extendedAddressing ? 1 : 0;
+    int classicMax = 7 - ae;
 
-    if (payload.size() <= 7 - ae) {
+    if (payload.size() <= classicMax) {
+        // Fits the classic 4-bit SF_DL, sent as an 8-byte frame either way.
         QByteArray d(8, char(m_padByte));
         int i = 0;
         if (ae) d[i++] = char(m_addressExtension);
@@ -60,9 +76,26 @@ bool CanManager::sendIsoTp(quint32 txId, quint32 rxId, const QByteArray &payload
         return true;
     }
 
+    int escapeMax = m_fdMode ? (64 - 2 - ae) : 0;
+    if (m_fdMode && payload.size() <= escapeMax) {
+        // ISO 15765-2:2016 SF escape sequence: SF_DL==0 in the PCI nibble,
+        // actual length in the following byte. Lets a whole payload up to
+        // ~62 bytes go out as a single CAN FD frame instead of segmenting.
+        int frameSize = fdFrameSizeFor(ae + 2 + payload.size());
+        QByteArray d(frameSize, char(m_padByte));
+        int i = 0;
+        if (ae) d[i++] = char(m_addressExtension);
+        d[i] = char(0x00);
+        d[i + 1] = char(payload.size());
+        d.replace(i + 2, payload.size(), payload);
+        sendRaw(txId, d);
+        return true;
+    }
+
     int len = payload.size();
-    int ffChunk = 6 - ae;
-    QByteArray ff(8, char(m_padByte));
+    int frameSize = m_fdMode ? 64 : 8;
+    int ffChunk = frameSize - 2 - ae;
+    QByteArray ff(frameSize, char(m_padByte));
     int i = 0;
     if (ae) ff[i++] = char(m_addressExtension);
     ff[i] = char(0x10 | ((len >> 8) & 0xF));
@@ -85,14 +118,15 @@ bool CanManager::sendIsoTp(quint32 txId, quint32 rxId, const QByteArray &payload
         if (fs == 1) continue;
 
         int stminMs = stmin <= 0x7F ? stmin : 1;
-        int cfChunkMax = 7 - ae;
+        int cfChunkMax = frameSize - 1 - ae;
         int count = 0;
         while (sent < len && (bs == 0 || count < bs)) {
-            QByteArray cf(8, char(m_padByte));
+            int chunk = qMin(cfChunkMax, len - sent);
+            int cfSize = m_fdMode ? fdFrameSizeFor(ae + 1 + chunk) : 8;
+            QByteArray cf(cfSize, char(m_padByte));
             int j = 0;
             if (ae) cf[j++] = char(m_addressExtension);
             cf[j] = char(0x20 | (seq & 0xF));
-            int chunk = qMin(cfChunkMax, len - sent);
             cf.replace(j + 1, chunk, payload.mid(sent, chunk));
             sendRaw(txId, cf);
             sent += chunk;
@@ -118,15 +152,24 @@ QByteArray CanManager::receiveIsoTp(quint32 txId, quint32 rxId, int timeoutMs) {
     quint8 pci = static_cast<quint8>(d[ae]);
     int type = (pci >> 4) & 0xF;
 
-    if (type == 0x0)
-        return d.mid(ae + 1, pci & 0xF);
+    if (type == 0x0) {
+        quint8 sfDl = pci & 0xF;
+        if (sfDl == 0) {
+            // ISO 15765-2:2016 SF escape sequence (CAN FD single frames > 7 bytes)
+            if (d.size() <= ae + 1) return QByteArray();
+            quint8 escLen = static_cast<quint8>(d[ae + 1]);
+            return d.mid(ae + 2, escLen);
+        }
+        return d.mid(ae + 1, sfDl);
+    }
 
     if (type != 0x1) return QByteArray();
 
     int expectedLen = ((pci & 0xF) << 8) | static_cast<quint8>(d[ae + 1]);
     QByteArray result = d.mid(ae + 2);
 
-    QByteArray fc(ae + 3, char(0));
+    int fcFrameSize = m_fdMode ? fdFrameSizeFor(ae + 3) : 8;
+    QByteArray fc(fcFrameSize, char(m_padByte));
     if (ae) fc[0] = char(m_addressExtension);
     fc[ae] = char(0x30);
     sendRaw(txId, fc);
@@ -157,17 +200,39 @@ QJsonObject CanManager::listInterfaces(const QString &plugin) {
             for (const auto &info : infos) names << info.name();
             lines << QString("%1: %2").arg(p, names.isEmpty() ? (err.isEmpty() ? "none" : "error: " + err) : names.join(", "));
         }
+#ifdef MCPSERVERLIB_HAVE_GSUSB
+        if (plugin.isEmpty() || plugin == "gsusb") {
+            QString err;
+            QStringList ids = GsUsbCanBusDevice::availableDevices(&err);
+            lines << QString("gsusb: %1").arg(ids.isEmpty() ? (err.isEmpty() ? "none" : "error: " + err) : ids.join(", "));
+        }
+#endif
         return udsTextResult(lines.join(" | "));
     });
 }
 
 QJsonObject CanManager::open(const QString &plugin, const QString &interfaceName, quint8 padByte, bool forceExtendedId,
-                              bool extendedAddressing, quint8 addressExtension) {
-    return onOwnThread([this, plugin, interfaceName, padByte, forceExtendedId, extendedAddressing, addressExtension]() -> QJsonObject {
+                              bool extendedAddressing, quint8 addressExtension, bool fdMode, quint32 bitrate,
+                              quint32 dataBitrate, bool bitrateSwitch) {
+    return onOwnThread([this, plugin, interfaceName, padByte, forceExtendedId, extendedAddressing, addressExtension,
+                         fdMode, bitrate, dataBitrate, bitrateSwitch]() -> QJsonObject {
         QString err;
-        QCanBusDevice *newDevice = QCanBus::instance()->createDevice(plugin, interfaceName, &err);
+        QCanBusDevice *newDevice = nullptr;
+        if (plugin == "gsusb") {
+#ifdef MCPSERVERLIB_HAVE_GSUSB
+            newDevice = new GsUsbCanBusDevice(interfaceName);
+#else
+            return udsTextResult("gsusb support was not compiled into this build of mcpserverlib (libusb not found)", true);
+#endif
+        } else {
+            newDevice = QCanBus::instance()->createDevice(plugin, interfaceName, &err);
+        }
         if (!newDevice)
             return udsTextResult("failed to open " + plugin + ":" + interfaceName + ": " + err, true);
+
+        if (fdMode) newDevice->setConfigurationParameter(QCanBusDevice::CanFdKey, true);
+        if (bitrate) newDevice->setConfigurationParameter(QCanBusDevice::BitRateKey, bitrate);
+        if (fdMode && dataBitrate) newDevice->setConfigurationParameter(QCanBusDevice::DataBitRateKey, dataBitrate);
 
         connect(newDevice, &QCanBusDevice::framesReceived, this, &CanManager::onFramesReceived);
         if (!newDevice->connectDevice()) {
@@ -185,7 +250,9 @@ QJsonObject CanManager::open(const QString &plugin, const QString &interfaceName
         m_forceExtendedId = forceExtendedId;
         m_extendedAddressing = extendedAddressing;
         m_addressExtension = addressExtension;
-        return udsTextResult("opened " + interfaceName);
+        m_fdMode = fdMode;
+        m_fdBitrateSwitch = fdMode && bitrateSwitch;
+        return udsTextResult("opened " + interfaceName + (fdMode ? " (CAN FD)" : ""));
     });
 }
 
@@ -213,7 +280,9 @@ QJsonObject CanManager::getReceivedFrames(int limit) {
             const auto &f = m_buffer.at(i);
             arr.append(QJsonObject{
                 {"id", QString("0x%1").arg(f.frameId(), 0, 16)},
-                {"data", udsHexBytes(f.payload())}
+                {"data", udsHexBytes(f.payload())},
+                {"fd", f.hasFlexibleDataRateFormat()},
+                {"brs", f.hasBitrateSwitch()}
             });
         }
         m_buffer.erase(m_buffer.begin(), m_buffer.begin() + n);
@@ -282,7 +351,7 @@ QJsonObject CanListInterfacesCommand::definition() const {
         {"inputSchema", QJsonObject{
             {"type", "object"},
             {"properties", QJsonObject{
-                {"plugin", QJsonObject{{"type", "string"}, {"description", "e.g. socketcan, peakcan, tinycan, passthrucan, virtualcan. Omit to list all available plugins"}}}
+                {"plugin", QJsonObject{{"type", "string"}, {"description", "e.g. socketcan, socketcanfd, peakcan, tinycan, passthrucan, virtualcan, gsusb. Omit to list all available plugins. On Linux, gs_usb/candleLight-class CAN-FD adapters bind to the kernel driver and enumerate under socketcan/socketcanfd. On Windows (no such kernel driver) they're reached directly over USB via the built-in 'gsusb' backend instead - its entries are serial numbers (or bus/address if no serial)"}}}
             }}
         }}
     };
@@ -298,12 +367,16 @@ QJsonObject CanOpenCommand::definition() const {
         {"inputSchema", QJsonObject{
             {"type", "object"},
             {"properties", QJsonObject{
-                {"plugin", QJsonObject{{"type", "string"}, {"description", "backend plugin name as returned by can_list_interfaces, e.g. socketcan, peakcan, tinycan, passthrucan, virtualcan"}}},
+                {"plugin", QJsonObject{{"type", "string"}, {"description", "backend plugin name as returned by can_list_interfaces, e.g. socketcan, socketcanfd, peakcan, tinycan, passthrucan, virtualcan, gsusb"}}},
                 {"interface", QJsonObject{{"type", "string"}, {"description", "an interface name as returned by can_list_interfaces for the chosen plugin"}}},
                 {"paddingByte", QJsonObject{{"type", "integer"}, {"description", "byte used to pad ISO-TP frames to 8 bytes, default 0x00, common alternatives 0xAA/0xCC"}}},
                 {"extendedId", QJsonObject{{"type", "boolean"}, {"description", "force 29-bit extended CAN IDs; IDs above 0x7FF already get this automatically, so this is only needed to force it for a smaller ID"}}},
                 {"extendedAddressing", QJsonObject{{"type", "boolean"}, {"description", "ISO-TP extended addressing: prepend addressExtension as an address-extension byte before the PCI byte on every frame"}}},
-                {"addressExtension", QJsonObject{{"type", "integer"}, {"description", "address-extension byte value, only used when extendedAddressing is true"}}}
+                {"addressExtension", QJsonObject{{"type", "integer"}, {"description", "address-extension byte value, only used when extendedAddressing is true"}}},
+                {"fd", QJsonObject{{"type", "boolean"}, {"description", "enable CAN FD (up to 64-byte frames), e.g. for a gs_usb/candleLight-class adapter (socketcan/socketcanfd on Linux, gsusb on Windows). Default false (classic CAN, 8-byte frames)"}}},
+                {"bitrate", QJsonObject{{"type", "integer"}, {"description", "nominal (arbitration phase) bitrate in bit/s, e.g. 500000. Omit to use the interface's configured default"}}},
+                {"dataBitrate", QJsonObject{{"type", "integer"}, {"description", "CAN FD data-phase bitrate in bit/s, e.g. 2000000. Only used when fd is true"}}},
+                {"bitrateSwitch", QJsonObject{{"type", "boolean"}, {"description", "use bit-rate switching (BRS) for the data phase of FD frames. Default true when fd is true and dataBitrate is set"}}}
             }},
             {"required", QJsonArray{"plugin", "interface"}}
         }}
@@ -314,7 +387,12 @@ QJsonObject CanOpenCommand::execute(const QJsonObject &args) {
     bool extendedId = args["extendedId"].toBool();
     bool extendedAddressing = args["extendedAddressing"].toBool();
     quint8 addressExtension = static_cast<quint8>(args["addressExtension"].toInt());
-    return m_manager->open(args["plugin"].toString(), args["interface"].toString(), padByte, extendedId, extendedAddressing, addressExtension);
+    bool fdMode = args["fd"].toBool();
+    quint32 bitrate = static_cast<quint32>(args["bitrate"].toInt(0));
+    quint32 dataBitrate = static_cast<quint32>(args["dataBitrate"].toInt(0));
+    bool bitrateSwitch = args.contains("bitrateSwitch") ? args["bitrateSwitch"].toBool() : (dataBitrate != 0);
+    return m_manager->open(args["plugin"].toString(), args["interface"].toString(), padByte, extendedId, extendedAddressing,
+                            addressExtension, fdMode, bitrate, dataBitrate, bitrateSwitch);
 }
 
 QJsonObject CanCloseCommand::definition() const {
