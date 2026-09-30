@@ -3,7 +3,9 @@
 #include <QObject>
 #include <QCanBusDevice>
 #include <QCanBusFrame>
+#include <QJsonObject>
 #include <QMap>
+#include <QMutex>
 #include <QTimer>
 #include <QThread>
 #include <functional>
@@ -24,6 +26,10 @@ public:
     QJsonObject sendUdsRequest(quint32 txId, quint32 rxId, const QByteArray &payload, int timeoutMs);
     QJsonObject testerPresentStart(quint32 id, int intervalMs, bool functional, bool suppressPositiveResponse);
     QJsonObject testerPresentStop(const QString &handle);
+    // A snapshot of the connection and its running tester presents, safe to
+    // call from any thread: it never waits for this manager's own thread,
+    // which may be busy in a request.
+    QJsonObject status() const;
 
 signals:
     void frameAppended();
@@ -55,6 +61,13 @@ private:
     QList<QCanBusFrame> m_buffer;
     QMap<QString, QTimer *> m_testerPresentTimers;
     int m_handleCounter = 0;
+
+    void publishStatus(); // on this manager's thread, after every change
+    QString m_plugin, m_interface;
+    quint32 m_bitrate = 0, m_dataBitrate = 0;
+    QMap<QString, QJsonObject> m_testerPresentInfo; // handle -> what it keeps alive
+    mutable QMutex m_statusMutex;
+    QJsonObject m_status;
 };
 
 class MCPSERVERLIB_EXPORT CanCommandBase : public McpCommand {

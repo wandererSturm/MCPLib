@@ -34,6 +34,36 @@ target_link_libraries(your_app PRIVATE mcpserverlib)
 Headers are exported via `target_include_directories(... PUBLIC ...)`, so no
 manual `include_directories()` call is needed.
 
+### Just the tools, without the server
+
+The same sources also build **`mcpcommands`**: a static library with
+`McpCommand`, the registry and every tool (CAN/UDS, DoIP, HSFZ) but no MCP
+server — for running the tools inside an application of your own. It needs
+only Qt `Core`, `Network` and `SerialBus`; turn the server off to skip Qt
+HttpServer entirely:
+
+```cmake
+set(MCPLIB_BUILD_SERVER OFF CACHE BOOL "" FORCE)
+add_subdirectory(path/to/mcpserverlib)
+target_link_libraries(your_app PRIVATE mcpcommands)
+mcplib_deploy_libusb(your_app) # copies libusb-1.0.dll next to it, when gs_usb is built in
+```
+
+The tool managers (`CanManager`, `DoipManager`, `HsfzManager`) wait for
+vehicle responses in nested event loops, so give them a thread of their own
+rather than your UI thread. Each has a `status()` — the open connection and
+its running tester presents — that is safe to call from any thread without
+waiting for the manager's.
+
+### gs_usb adapters (libusb)
+
+gs_usb CAN/CAN-FD adapters (candleLight, CANable, …) are reached over libusb
+when it's found at configure time. Point `LIBUSB_ROOT` at an install prefix
+(with `include/`, `lib/`, `bin/`), e.g. vcpkg's
+`-DLIBUSB_ROOT=C:/vcpkg/installed/x64-windows`; `VCPKG_ROOT` and
+`%USERPROFILE%/vcpkg` are searched too. libusb is plain C, so the MSVC-built
+vcpkg package works from MinGW builds as well.
+
 ## Usage
 
 ```cpp

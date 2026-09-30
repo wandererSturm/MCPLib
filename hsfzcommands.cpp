@@ -11,7 +11,33 @@
 
 static const quint8 HSFZ_TYPE_DIAG = 0x01;
 
-HsfzManager::HsfzManager(QObject *parent) : QObject(parent) {}
+HsfzManager::HsfzManager(QObject *parent) : QObject(parent) {
+    publishStatus();
+}
+
+void HsfzManager::publishStatus() {
+    const bool connected = m_socket && m_socket->state() == QAbstractSocket::ConnectedState;
+    QJsonObject s{{"connected", connected}};
+    if (connected) {
+        s["host"] = m_host;
+        s["port"] = int(m_port);
+        s["sourceAddress"] = QString("0x%1").arg(m_sourceAddress, 2, 16, QChar('0'));
+    }
+    QJsonArray tp;
+    for (auto it = m_testerPresentInfo.cbegin(); it != m_testerPresentInfo.cend(); ++it) {
+        QJsonObject info = it.value();
+        info["handle"] = it.key();
+        tp.append(info);
+    }
+    s["testerPresent"] = tp;
+    QMutexLocker locker(&m_statusMutex);
+    m_status = s;
+}
+
+QJsonObject HsfzManager::status() const {
+    QMutexLocker locker(&m_statusMutex);
+    return m_status;
+}
 
 void HsfzManager::sendMessage(quint8 target, quint8 type, const QByteArray &payload) {
     if (!m_socket) return;
@@ -142,7 +168,11 @@ QJsonObject HsfzManager::open(const QString &host, quint16 port, quint8 sourceAd
         m_recvBuffer.clear();
         m_buffer.clear();
         m_sourceAddress = sourceAddress;
+        m_host = host;
+        m_port = port;
         connect(m_socket, &QTcpSocket::readyRead, this, &HsfzManager::onReadyRead);
+        connect(m_socket, &QAbstractSocket::disconnected, this, [this] { publishStatus(); }); // the vehicle hung up
+        publishStatus();
 
         return udsTextResult(QString("connected to %1:%2").arg(host).arg(port));
     });
@@ -155,12 +185,17 @@ QJsonObject HsfzManager::close() {
             t->deleteLater();
         }
         m_testerPresentTimers.clear();
-        if (!m_socket) return udsTextResult("already closed");
+        m_testerPresentInfo.clear();
+        if (!m_socket) {
+            publishStatus();
+            return udsTextResult("already closed");
+        }
         m_socket->disconnectFromHost();
         delete m_socket;
         m_socket = nullptr;
         m_buffer.clear();
         m_recvBuffer.clear();
+        publishStatus();
         return udsTextResult("closed");
     });
 }
@@ -218,6 +253,9 @@ QJsonObject HsfzManager::testerPresentStart(quint8 targetAddress, int intervalMs
         });
         timer->start(intervalMs);
         m_testerPresentTimers.insert(handle, timer);
+        m_testerPresentInfo.insert(handle, QJsonObject{{"target", QString("0x%1").arg(targetAddress, 2, 16, QChar('0'))},
+                                                       {"intervalMs", intervalMs}});
+        publishStatus();
         return udsTextResult(handle);
     });
 }
@@ -229,6 +267,8 @@ QJsonObject HsfzManager::testerPresentStop(const QString &handle) {
         it.value()->stop();
         it.value()->deleteLater();
         m_testerPresentTimers.erase(it);
+        m_testerPresentInfo.remove(handle);
+        publishStatus();
         return udsTextResult("stopped");
     });
 }

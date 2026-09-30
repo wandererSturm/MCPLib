@@ -11,7 +11,36 @@
 #include "gsusbcanbus.h"
 #endif
 
-CanManager::CanManager(QObject *parent) : QObject(parent) {}
+CanManager::CanManager(QObject *parent) : QObject(parent) {
+    publishStatus();
+}
+
+void CanManager::publishStatus() {
+    QJsonObject s{{"open", m_device != nullptr}};
+    if (m_device) {
+        s["plugin"] = m_plugin;
+        s["interface"] = m_interface;
+        if (m_bitrate) s["bitrate"] = qint64(m_bitrate);
+        s["fd"] = m_fdMode;
+        if (m_fdMode && m_dataBitrate) s["dataBitrate"] = qint64(m_dataBitrate);
+        s["extendedId"] = m_forceExtendedId;
+        s["extendedAddressing"] = m_extendedAddressing;
+    }
+    QJsonArray tp;
+    for (auto it = m_testerPresentInfo.cbegin(); it != m_testerPresentInfo.cend(); ++it) {
+        QJsonObject info = it.value();
+        info["handle"] = it.key();
+        tp.append(info);
+    }
+    s["testerPresent"] = tp;
+    QMutexLocker locker(&m_statusMutex);
+    m_status = s;
+}
+
+QJsonObject CanManager::status() const {
+    QMutexLocker locker(&m_statusMutex);
+    return m_status;
+}
 
 void CanManager::onFramesReceived() {
     while (m_device && m_device->framesAvailable())
@@ -252,6 +281,11 @@ QJsonObject CanManager::open(const QString &plugin, const QString &interfaceName
         m_addressExtension = addressExtension;
         m_fdMode = fdMode;
         m_fdBitrateSwitch = fdMode && bitrateSwitch;
+        m_plugin = plugin;
+        m_interface = interfaceName;
+        m_bitrate = bitrate;
+        m_dataBitrate = dataBitrate;
+        publishStatus();
         return udsTextResult("opened " + interfaceName + (fdMode ? " (CAN FD)" : ""));
     });
 }
@@ -263,11 +297,16 @@ QJsonObject CanManager::close() {
             t->deleteLater();
         }
         m_testerPresentTimers.clear();
-        if (!m_device) return udsTextResult("already closed");
+        m_testerPresentInfo.clear();
+        if (!m_device) {
+            publishStatus();
+            return udsTextResult("already closed");
+        }
         m_device->disconnectDevice();
         delete m_device;
         m_device = nullptr;
         m_buffer.clear();
+        publishStatus();
         return udsTextResult("closed");
     });
 }
@@ -329,6 +368,10 @@ QJsonObject CanManager::testerPresentStart(quint32 id, int intervalMs, bool func
         });
         timer->start(intervalMs);
         m_testerPresentTimers.insert(handle, timer);
+        m_testerPresentInfo.insert(handle, QJsonObject{{"id", QString("0x%1").arg(id, 0, 16)},
+                                                       {"intervalMs", intervalMs},
+                                                       {"functional", functional}});
+        publishStatus();
         return udsTextResult(handle);
     });
 }
@@ -340,6 +383,8 @@ QJsonObject CanManager::testerPresentStop(const QString &handle) {
         it.value()->stop();
         it.value()->deleteLater();
         m_testerPresentTimers.erase(it);
+        m_testerPresentInfo.remove(handle);
+        publishStatus();
         return udsTextResult("stopped");
     });
 }
