@@ -276,7 +276,7 @@ QJsonObject HsfzManager::testerPresentStop(const QString &handle) {
 QJsonObject HsfzOpenCommand::definition() const {
     return QJsonObject{
         {"name", "hsfz_open"},
-        {"description", "Step 1 (or 2, after hsfz_discover_vehicles) of the HSFZ workflow: opens a TCP connection to a vehicle over BMW HSFZ (a proprietary Ethernet/TCP diagnostic transport, predecessor to DoIP, used via ICOM/ENET-type interface cables). Unlike DoIP there is no routing-activation handshake - the connection is ready for diagnostics as soon as this succeeds. After this succeeds, use hsfz_send_request to talk to an ECU by its (single-byte) address - you do not need to build or parse raw HSFZ frames yourself. Full workflow: hsfz_discover_vehicles (optional, best-effort) -> hsfz_open (once) -> any number of hsfz_send_request / hsfz_tester_present_start+stop calls -> hsfz_close when done."},
+        {"description", "Connects to a BMW over HSFZ (ENET cable; IP from hsfz_discover_vehicles); then send requests with hsfz_send_request to an ECU's one-byte address."},
         {"inputSchema", QJsonObject{
             {"type", "object"},
             {"properties", QJsonObject{
@@ -299,7 +299,7 @@ QJsonObject HsfzOpenCommand::execute(const QJsonObject &args) {
 QJsonObject HsfzCloseCommand::definition() const {
     return QJsonObject{
         {"name", "hsfz_close"},
-        {"description", "Close the current HSFZ connection and stop any running hsfz_tester_present_start timers. Safe to call even if nothing is open."},
+        {"description", "Closes the HSFZ connection and stops its tester presents."},
         {"inputSchema", QJsonObject{{"type", "object"}}}
     };
 }
@@ -310,11 +310,11 @@ QJsonObject HsfzCloseCommand::execute(const QJsonObject &) {
 QJsonObject HsfzGetReceivedMessagesCommand::definition() const {
     return QJsonObject{
         {"name", "hsfz_get_received_messages"},
-        {"description", "Debugging/inspection tool only - drains up to 500 buffered raw HSFZ messages seen since the last call. You do NOT need this for normal request/response diagnostics: hsfz_send_request already returns the decoded UDS payload directly. Use this to investigate unexpected traffic or connection issues."},
+        {"description", "Raw HSFZ messages seen since the last call - only for investigating connection problems. Not needed for normal requests."},
         {"inputSchema", QJsonObject{
             {"type", "object"},
             {"properties", QJsonObject{
-                {"limit", QJsonObject{{"type", "integer"}}}
+                {"limit", QJsonObject{{"type", "integer"}, {"description", "at most this many (default all, up to 500)"}}}
             }}
         }}
     };
@@ -326,16 +326,12 @@ QJsonObject HsfzGetReceivedMessagesCommand::execute(const QJsonObject &args) {
 QJsonObject HsfzSendRequestCommand::definition() const {
     return QJsonObject{
         {"name", "hsfz_send_request"},
-        {"description", "Requires hsfz_open to have succeeded first. Sends one UDS (ISO 14229) diagnostic request to a specific ECU over the open HSFZ connection and blocks until the full response arrives or timeoutMs elapses, returning the decoded UDS payload as a space-separated hex string (e.g. '62 f1 90 ...'), NOT a raw HSFZ frame. ECU 'response pending' (NRC 0x78) is automatically waited out and retried internally. A negative response (0x7F ...) is returned as an error result naming the NRC, not as raw bytes. One call = one request/response pair; call it again for each subsequent request (e.g. session control, then security access, then the actual read/write service)."},
+        {"description", "Sends one UDS request to a BMW ECU (targetAddress, one byte) over HSFZ and returns its answer as hex, e.g. '62 F1 90 ...'. A negative answer comes back as an error naming the NRC. Needs hsfz_open."},
         {"inputSchema", QJsonObject{
             {"type", "object"},
             {"properties", QJsonObject{
                 {"targetAddress", QJsonObject{{"type", "string"}, {"description", "the target ECU's HSFZ address, a single byte as a hex string like \"0x10\" or a decimal number (unlike DoIP's 16-bit logical address, HSFZ addresses are one byte). The same open connection can address different ECUs by changing this on each call."}}},
-                {"data", QJsonObject{
-                    {"type", "array"},
-                    {"items", QJsonObject{{"type", "integer"}}},
-                    {"description", "The raw UDS request bytes as plain decimal integers 0-255 (NOT hex strings) - the first byte is the Service ID (SID). E.g. [16, 3] = DiagnosticSessionControl(0x10) to extendedDiagnosticSession(0x03); [34, 241, 144] = ReadDataByIdentifier(0x22) of DID 0xF190 (VIN)."}
-                }},
+                {"data", QJsonObject{{"type", "string"}, {"description", "The UDS request as hex bytes, e.g. \"22 F1 90\" (read the VIN); the first byte is the service ID. An array of numbers 0-255 works too. No framing or length bytes."}}},
                 {"timeoutMs", QJsonObject{{"type", "integer"}, {"description", "how long to wait for the complete response, default 2000ms"}}}
             }},
             {"required", QJsonArray{"targetAddress", "data"}}
@@ -345,7 +341,9 @@ QJsonObject HsfzSendRequestCommand::definition() const {
 QJsonObject HsfzSendRequestCommand::execute(const QJsonObject &args) {
     quint8 targetAddress = static_cast<quint8>(udsParseId(args["targetAddress"]));
     QByteArray payload;
-    for (const auto &v : args["data"].toArray()) payload.append(char(v.toInt()));
+    QString bytesError;
+    payload = udsParseBytes(args["data"], &bytesError);
+    if (!bytesError.isEmpty()) return udsTextResult(bytesError, true);
     int timeoutMs = args.contains("timeoutMs") ? args["timeoutMs"].toInt() : 2000;
     return m_manager->sendUdsRequest(targetAddress, payload, timeoutMs);
 }
@@ -353,7 +351,7 @@ QJsonObject HsfzSendRequestCommand::execute(const QJsonObject &args) {
 QJsonObject HsfzTesterPresentStartCommand::definition() const {
     return QJsonObject{
         {"name", "hsfz_tester_present_start"},
-        {"description", "Requires hsfz_open to have succeeded first. Starts a background timer that periodically sends UDS TesterPresent (0x3E) fire-and-forget (it does NOT wait for or return the ECU's response). Use this to keep a non-default diagnostic session (e.g. extendedDiagnosticSession) from timing out while you do other work; not required for simple one-off requests in the default session. Returns a handle immediately - call hsfz_tester_present_stop with that handle when done (it's also auto-stopped on hsfz_close)."},
+        {"description", "Keeps an ECU's diagnostic session open by sending TesterPresent every intervalMs - only needed in a non-default session (after 10 03). Returns a handle for hsfz_tester_present_stop."},
         {"inputSchema", QJsonObject{
             {"type", "object"},
             {"properties", QJsonObject{
@@ -375,11 +373,11 @@ QJsonObject HsfzTesterPresentStartCommand::execute(const QJsonObject &args) {
 QJsonObject HsfzTesterPresentStopCommand::definition() const {
     return QJsonObject{
         {"name", "hsfz_tester_present_stop"},
-        {"description", "Stop a running HSFZ TesterPresent timer"},
+        {"description", "Stops a tester present started with hsfz_tester_present_start."},
         {"inputSchema", QJsonObject{
             {"type", "object"},
             {"properties", QJsonObject{
-                {"handle", QJsonObject{{"type", "string"}}}
+                {"handle", QJsonObject{{"type", "string"}, {"description", "the handle the matching _start call returned, e.g. \"tp_1\""}}}
             }},
             {"required", QJsonArray{"handle"}}
         }}
@@ -392,7 +390,7 @@ QJsonObject HsfzTesterPresentStopCommand::execute(const QJsonObject &args) {
 QJsonObject HsfzDiscoverVehiclesCommand::definition() const {
     return QJsonObject{
         {"name", "hsfz_discover_vehicles"},
-        {"description", "Optional first step of the HSFZ workflow, only needed when you don't already know the interface's IP address. Best-effort scan for HSFZ-capable hosts (BMW ENET/ICOM). Unlike DoIP, HSFZ has no standardized discovery broadcast, so this is a parallel TCP connect-scan (just checks if something answers on the port), not a real vehicle announcement - it returns bare IP addresses, not VINs. Does not require hsfz_open first. If no hosts are given, it auto-scans the /24 around any local 169.254.x.x link-local interface (the typical ENET cable addressing). Use a returned IP as the host argument to hsfz_open."},
+        {"description", "Finds BMW HSFZ interfaces (ENET cable, ICOM) on the local network and returns their IP addresses. Use one with hsfz_open. Skip it if you know the IP."},
         {"inputSchema", QJsonObject{
             {"type", "object"},
             {"properties", QJsonObject{
