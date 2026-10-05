@@ -90,7 +90,7 @@ static int pciTypeAt(const QByteArray &d, int ae) {
     return (static_cast<quint8>(d[ae]) >> 4) & 0xF;
 }
 
-bool CanManager::sendIsoTp(quint32 txId, quint32 rxId, const QByteArray &payload) {
+bool CanManager::sendIsoTp(quint32 txId, quint32 rxId, const QByteArray &payload, quint8 ext) {
     int ae = m_extendedAddressing ? 1 : 0;
     int classicMax = 7 - ae;
 
@@ -98,7 +98,7 @@ bool CanManager::sendIsoTp(quint32 txId, quint32 rxId, const QByteArray &payload
         // Fits the classic 4-bit SF_DL, sent as an 8-byte frame either way.
         QByteArray d(8, char(m_padByte));
         int i = 0;
-        if (ae) d[i++] = char(m_addressExtension);
+        if (ae) d[i++] = char(ext);
         d[i] = char(payload.size());
         d.replace(i + 1, payload.size(), payload);
         sendRaw(txId, d);
@@ -113,7 +113,7 @@ bool CanManager::sendIsoTp(quint32 txId, quint32 rxId, const QByteArray &payload
         int frameSize = fdFrameSizeFor(ae + 2 + payload.size());
         QByteArray d(frameSize, char(m_padByte));
         int i = 0;
-        if (ae) d[i++] = char(m_addressExtension);
+        if (ae) d[i++] = char(ext);
         d[i] = char(0x00);
         d[i + 1] = char(payload.size());
         d.replace(i + 2, payload.size(), payload);
@@ -126,7 +126,7 @@ bool CanManager::sendIsoTp(quint32 txId, quint32 rxId, const QByteArray &payload
     int ffChunk = frameSize - 2 - ae;
     QByteArray ff(frameSize, char(m_padByte));
     int i = 0;
-    if (ae) ff[i++] = char(m_addressExtension);
+    if (ae) ff[i++] = char(ext);
     ff[i] = char(0x10 | ((len >> 8) & 0xF));
     ff[i + 1] = char(len & 0xFF);
     ff.replace(i + 2, ffChunk, payload.left(ffChunk));
@@ -154,7 +154,7 @@ bool CanManager::sendIsoTp(quint32 txId, quint32 rxId, const QByteArray &payload
             int cfSize = m_fdMode ? fdFrameSizeFor(ae + 1 + chunk) : 8;
             QByteArray cf(cfSize, char(m_padByte));
             int j = 0;
-            if (ae) cf[j++] = char(m_addressExtension);
+            if (ae) cf[j++] = char(ext);
             cf[j] = char(0x20 | (seq & 0xF));
             cf.replace(j + 1, chunk, payload.mid(sent, chunk));
             sendRaw(txId, cf);
@@ -167,7 +167,7 @@ bool CanManager::sendIsoTp(quint32 txId, quint32 rxId, const QByteArray &payload
     return true;
 }
 
-QByteArray CanManager::receiveIsoTp(quint32 txId, quint32 rxId, int timeoutMs) {
+QByteArray CanManager::receiveIsoTp(quint32 txId, quint32 rxId, int timeoutMs, quint8 ext) {
     int ae = m_extendedAddressing ? 1 : 0;
 
     QCanBusFrame frame = waitForFrame(rxId, timeoutMs, [ae](const QCanBusFrame &f) {
@@ -199,7 +199,7 @@ QByteArray CanManager::receiveIsoTp(quint32 txId, quint32 rxId, int timeoutMs) {
 
     int fcFrameSize = m_fdMode ? fdFrameSizeFor(ae + 3) : 8;
     QByteArray fc(fcFrameSize, char(m_padByte));
-    if (ae) fc[0] = char(m_addressExtension);
+    if (ae) fc[0] = char(ext);
     fc[ae] = char(0x30);
     sendRaw(txId, fc);
 
@@ -329,15 +329,41 @@ QJsonObject CanManager::getReceivedFrames(int limit) {
     });
 }
 
-QJsonObject CanManager::sendUdsRequest(quint32 txId, quint32 rxId, const QByteArray &payload, int timeoutMs) {
-    return onOwnThread([this, txId, rxId, payload, timeoutMs]() -> QJsonObject {
+// BMW D-CAN: the tester (0xF1) sends on 0x600 + its address; an ECU
+// answers on 0x600 + its own, its frames starting with the tester's address.
+static constexpr quint32 BmwTesterAddress = 0xF1;
+static constexpr quint32 BmwIdBase = 0x600;
+
+QJsonObject CanManager::sendUdsRequest(qint64 txIdIn, qint64 rxIdIn, const QByteArray &payload, int timeoutMs,
+                                       int targetAddress) {
+    return onOwnThread([this, txIdIn, rxIdIn, payload, timeoutMs, targetAddress]() -> QJsonObject {
         if (!m_device) return udsTextResult("no CAN interface open", true);
-        if (!sendIsoTp(txId, rxId, payload))
-            return udsTextResult("failed to send request (no flow control from ECU)", true);
+        if (targetAddress >= 0 && !m_extendedAddressing)
+            return udsTextResult("targetAddress is for extended addressing (BMW D-CAN): can_open with "
+                                 "extendedAddressing=true first, or address the ECU by txId/rxId alone", true);
+        const quint8 ext = targetAddress >= 0 ? quint8(targetAddress) : m_addressExtension;
+        if (m_extendedAddressing && ext == BmwTesterAddress)
+            return udsTextResult("0xF1 is the tester's own address, not an ECU's: set targetAddress to the ECU "
+                                 "(e.g. 0x12 for the engine/DME)", true);
+        if ((txIdIn < 0 || rxIdIn < 0) && !m_extendedAddressing)
+            return udsTextResult("txId and rxId are required (e.g. 0x7E0 / 0x7E8)", true);
+        const quint32 txId = txIdIn >= 0 ? quint32(txIdIn) : BmwIdBase + BmwTesterAddress;
+        const quint32 rxId = rxIdIn >= 0 ? quint32(rxIdIn) : BmwIdBase + ext;
+        const QString route = m_extendedAddressing
+            ? QString("sent on 0x%1 to ECU 0x%2, listening on 0x%3")
+                  .arg(txId, 0, 16).arg(ext, 2, 16, QChar('0')).arg(rxId, 0, 16)
+            : QString("sent on 0x%1, listening on 0x%2").arg(txId, 0, 16).arg(rxId, 0, 16);
+
+        if (!sendIsoTp(txId, rxId, payload, ext))
+            return udsTextResult(QString("failed to send request: no flow control from the ECU (%1)").arg(route), true);
 
         for (int attempt = 0; attempt < 10; ++attempt) {
-            QByteArray resp = receiveIsoTp(txId, rxId, timeoutMs);
-            if (resp.isEmpty()) return udsTextResult("timeout waiting for response", true);
+            QByteArray resp = receiveIsoTp(txId, rxId, timeoutMs, ext);
+            if (resp.isEmpty())
+                return udsTextResult(QString("timeout waiting for response (%1)%2").arg(route,
+                    m_extendedAddressing ? QString("; with extended addressing the ECU answers on 0x600 + its "
+                                                   "address - check targetAddress")
+                                         : QString()), true);
             if (resp.size() >= 3 && static_cast<quint8>(resp[0]) == 0x7F) {
                 quint8 nrc = static_cast<quint8>(resp[2]);
                 if (nrc == 0x78) continue;
@@ -350,17 +376,25 @@ QJsonObject CanManager::sendUdsRequest(quint32 txId, quint32 rxId, const QByteAr
     });
 }
 
-QJsonObject CanManager::testerPresentStart(quint32 id, int intervalMs, bool functional, bool suppressPositiveResponse) {
-    return onOwnThread([this, id, intervalMs, functional, suppressPositiveResponse]() -> QJsonObject {
+QJsonObject CanManager::testerPresentStart(qint64 idIn, int intervalMs, bool functional, bool suppressPositiveResponse,
+                                           int targetAddress) {
+    return onOwnThread([this, idIn, intervalMs, functional, suppressPositiveResponse, targetAddress]() -> QJsonObject {
         if (!m_device) return udsTextResult("no CAN interface open", true);
+        if (targetAddress >= 0 && !m_extendedAddressing)
+            return udsTextResult("targetAddress is for extended addressing (BMW D-CAN): can_open with "
+                                 "extendedAddressing=true first", true);
+        const quint8 ext = targetAddress >= 0 ? quint8(targetAddress) : m_addressExtension;
+        if (idIn < 0 && !m_extendedAddressing)
+            return udsTextResult("id is required (the ECU's request ID, e.g. 0x7E0)", true);
+        const quint32 id = idIn >= 0 ? quint32(idIn) : BmwIdBase + BmwTesterAddress;
         QString handle = QString("tp_%1").arg(++m_handleCounter);
         quint8 sub = (functional || suppressPositiveResponse) ? 0x80 : 0x00;
         auto *timer = new QTimer(this);
-        connect(timer, &QTimer::timeout, this, [this, id, sub]() {
+        connect(timer, &QTimer::timeout, this, [this, id, sub, ext]() {
             int ae = m_extendedAddressing ? 1 : 0;
             QByteArray d(8, char(m_padByte));
             int i = 0;
-            if (ae) d[i++] = char(m_addressExtension);
+            if (ae) d[i++] = char(ext);
             d[i] = char(0x02);
             d[i + 1] = char(0x3E);
             d[i + 2] = char(sub);
@@ -368,9 +402,12 @@ QJsonObject CanManager::testerPresentStart(quint32 id, int intervalMs, bool func
         });
         timer->start(intervalMs);
         m_testerPresentTimers.insert(handle, timer);
-        m_testerPresentInfo.insert(handle, QJsonObject{{"id", QString("0x%1").arg(id, 0, 16)},
-                                                       {"intervalMs", intervalMs},
-                                                       {"functional", functional}});
+        QJsonObject info{{"id", QString("0x%1").arg(id, 0, 16)},
+                         {"intervalMs", intervalMs},
+                         {"functional", functional}};
+        if (m_extendedAddressing)
+            info["targetAddress"] = QString("0x%1").arg(ext, 2, 16, QChar('0'));
+        m_testerPresentInfo.insert(handle, info);
         publishStatus();
         return udsTextResult(handle);
     });
@@ -416,8 +453,8 @@ QJsonObject CanOpenCommand::definition() const {
                 {"interface", QJsonObject{{"type", "string"}, {"description", "an interface name as returned by can_list_interfaces for the chosen plugin"}}},
                 {"paddingByte", QJsonObject{{"type", "integer"}, {"description", "byte used to pad ISO-TP frames to 8 bytes, default 0x00, common alternatives 0xAA/0xCC. Most UDS/diagnostic ECUs expect frames padded to a full 8 bytes - leave this at default unless you know the vehicle uses unpadded/variable-length frames"}}},
                 {"extendedId", QJsonObject{{"type", "boolean"}, {"description", "force 29-bit extended CAN IDs; IDs above 0x7FF already get this automatically, so this is only needed to force it for a smaller ID. Most vehicle diagnostic buses use plain 11-bit (standard) IDs - leave this false unless told otherwise"}}},
-                {"extendedAddressing", QJsonObject{{"type", "boolean"}, {"description", "Enables ISO-TP 'extended addressing': prepends addressExtension as an extra address byte on every frame, used to select which ECU a message is for when multiple ECUs share the same CAN ID (common on some manufacturer-specific buses, e.g. several BMW modules answering different physical addresses on one shared tester-request ID). This is NOT the same as 29-bit extended CAN IDs (see extendedId) and is NOT needed for standard OBD-II/UDS addressing where each ECU has its own distinct request/response CAN ID pair (e.g. 0x7E0/0x7E8) - in that far more common case, leave this false and just set distinct txId/rxId per ECU in uds_send_request. Only enable this when a vehicle-specific diagnostic spec explicitly calls for a target-address byte."}}},
-                {"addressExtension", QJsonObject{{"type", "integer"}, {"description", "The address-extension/target-address byte value prepended to every frame, only used when extendedAddressing is true. This is a vehicle- and ECU-specific value from the diagnostic addressing table (e.g. 0x40) - it is applied the same way to both the request you send and expected in frames the ECU sends back."}}},
+                {"extendedAddressing", QJsonObject{{"type", "boolean"}, {"description", "ISO-TP extended addressing: the first byte of every frame you send is the target ECU's address. Turn it on for BMW D-CAN (all requests go out on 0x6F1, each ECU answers on 0x600 + its address); then pass targetAddress (the ECU) in each uds_send_request. Not the same as 29-bit IDs (extendedId). Leave false for normal UDS/OBD with a txId/rxId pair per ECU (e.g. 0x7E0/0x7E8)."}}},
+                {"addressExtension", QJsonObject{{"type", "integer"}, {"description", "With extendedAddressing: a default target ECU address, used when a request gives no targetAddress. Optional - prefer targetAddress per request. Never 0xF1: that is the tester's own address."}}},
                 {"fd", QJsonObject{{"type", "boolean"}, {"description", "enable CAN FD (up to 64-byte frames), e.g. for a gs_usb/candleLight-class adapter (socketcan/socketcanfd on Linux, gsusb on Windows). Default false (classic CAN, 8-byte frames). Most legacy vehicle diagnostic buses are classic CAN - only set this true if you know the specific bus/ECU supports CAN FD."}}},
                 {"bitrate", QJsonObject{{"type", "integer"}, {"description", "nominal (arbitration phase) bitrate in bit/s. Common vehicle values: 500000 (typical powertrain/diagnostic CAN) or 125000/100000 (typical lower-speed body/comfort CAN). Omitting this uses the interface's configured default, which for most adapters is NOT the vehicle's actual bitrate - if you don't already know the bus speed, ask the user rather than guessing, since a wrong value produces bit errors/garbage traffic that looks like a dead bus, not a clean timeout."}}},
                 {"dataBitrate", QJsonObject{{"type", "integer"}, {"description", "CAN FD data-phase bitrate in bit/s, e.g. 2000000. Only used when fd is true"}}},
@@ -474,8 +511,9 @@ QJsonObject UdsSendRequestCommand::definition() const {
         {"inputSchema", QJsonObject{
             {"type", "object"},
             {"properties", QJsonObject{
-                {"txId", QJsonObject{{"type", "string"}, {"description", "CAN ID this tester sends the request on (the ECU's physical request/'listen' ID), e.g. \"0x7E0\" (hex string with 0x prefix) or a plain decimal number. Must match the txId/rxId pair configured for can_open's addressing mode."}}},
-                {"rxId", QJsonObject{{"type", "string"}, {"description", "CAN ID the ECU's response is expected on, e.g. \"0x7E8\". Same format as txId."}}},
+                {"targetAddress", QJsonObject{{"type", "string"}, {"description", "Extended addressing (BMW D-CAN) only: the ECU's address byte, e.g. \"0x12\" (engine/DME), \"0x40\". With it, txId and rxId can be left out: 0x6F1 and 0x600 + targetAddress. Never 0xF1 (that is the tester)."}}},
+                {"txId", QJsonObject{{"type", "string"}, {"description", "CAN ID the request is sent on, e.g. \"0x7E0\". Required unless extended addressing derives it."}}},
+                {"rxId", QJsonObject{{"type", "string"}, {"description", "CAN ID the ECU answers on, e.g. \"0x7E8\". Required unless extended addressing derives it."}}},
                 {"data", QJsonObject{
                     {"type", "array"},
                     {"items", QJsonObject{{"type", "integer"}}},
@@ -483,17 +521,18 @@ QJsonObject UdsSendRequestCommand::definition() const {
                 }},
                 {"timeoutMs", QJsonObject{{"type", "integer"}, {"description", "how long to wait for the complete response, default 1000ms. Increase for slow services (e.g. routine control, flashing-related requests, or ECUs known to respond slowly)."}}}
             }},
-            {"required", QJsonArray{"txId", "rxId", "data"}}
+            {"required", QJsonArray{"data"}}
         }}
     };
 }
 QJsonObject UdsSendRequestCommand::execute(const QJsonObject &args) {
-    quint32 txId = udsParseId(args["txId"]);
-    quint32 rxId = udsParseId(args["rxId"]);
+    qint64 txId = args.contains("txId") ? qint64(udsParseId(args["txId"])) : -1;
+    qint64 rxId = args.contains("rxId") ? qint64(udsParseId(args["rxId"])) : -1;
+    int target = args.contains("targetAddress") ? int(udsParseId(args["targetAddress"]) & 0xFF) : -1;
     QByteArray payload;
     for (const auto &v : args["data"].toArray()) payload.append(char(v.toInt()));
     int timeoutMs = args.contains("timeoutMs") ? args["timeoutMs"].toInt() : 1000;
-    return m_manager->sendUdsRequest(txId, rxId, payload, timeoutMs);
+    return m_manager->sendUdsRequest(txId, rxId, payload, timeoutMs, target);
 }
 
 QJsonObject UdsTesterPresentStartCommand::definition() const {
@@ -503,21 +542,22 @@ QJsonObject UdsTesterPresentStartCommand::definition() const {
         {"inputSchema", QJsonObject{
             {"type", "object"},
             {"properties", QJsonObject{
-                {"id", QJsonObject{{"type", "string"}, {"description", "CAN ID to send on: the ECU's physical request ID (same as txId you used in uds_send_request) for addressing=physical, or the vehicle's broadcast ID (e.g. 0x7DF) for addressing=functional"}}},
+                {"id", QJsonObject{{"type", "string"}, {"description", "CAN ID to send on: the ECU's request ID (the txId of uds_send_request), or the broadcast ID (e.g. 0x7DF) for addressing=functional. With extended addressing it can be left out (0x6F1)."}}},
+                {"targetAddress", QJsonObject{{"type", "string"}, {"description", "Extended addressing (BMW D-CAN) only: the ECU to keep in its session, e.g. \"0x12\" - the same targetAddress as in uds_send_request."}}},
                 {"addressing", QJsonObject{{"type", "string"}, {"enum", QJsonArray{"physical", "functional"}}, {"description", "default physical. functional always suppresses the response regardless of suppressPositiveResponse"}}},
                 {"intervalMs", QJsonObject{{"type", "integer"}, {"description", "default 2000, keep below the ECU's S3 timeout (usually 5000ms)"}}},
                 {"suppressPositiveResponse", QJsonObject{{"type", "boolean"}, {"description", "default true, ignored (always true) when addressing=functional"}}}
             }},
-            {"required", QJsonArray{"id"}}
         }}
     };
 }
 QJsonObject UdsTesterPresentStartCommand::execute(const QJsonObject &args) {
-    quint32 id = udsParseId(args["id"]);
+    qint64 id = args.contains("id") ? qint64(udsParseId(args["id"])) : -1;
+    int target = args.contains("targetAddress") ? int(udsParseId(args["targetAddress"]) & 0xFF) : -1;
     int intervalMs = args.contains("intervalMs") ? args["intervalMs"].toInt() : 2000;
     bool functional = args["addressing"].toString() == "functional";
     bool suppress = args.contains("suppressPositiveResponse") ? args["suppressPositiveResponse"].toBool() : true;
-    return m_manager->testerPresentStart(id, intervalMs, functional, suppress);
+    return m_manager->testerPresentStart(id, intervalMs, functional, suppress, target);
 }
 
 QJsonObject UdsTesterPresentStopCommand::definition() const {

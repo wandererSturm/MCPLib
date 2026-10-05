@@ -23,8 +23,14 @@ public:
                       quint32 dataBitrate, bool bitrateSwitch);
     QJsonObject close();
     QJsonObject getReceivedFrames(int limit);
-    QJsonObject sendUdsRequest(quint32 txId, quint32 rxId, const QByteArray &payload, int timeoutMs);
-    QJsonObject testerPresentStart(quint32 id, int intervalMs, bool functional, bool suppressPositiveResponse);
+    // With extended addressing, targetAddress is the ECU's address byte for
+    // this request (-1: the one can_open set), and a txId/rxId of -1 is
+    // derived BMW D-CAN style: sent on 0x600 + tester address (0xF1, so
+    // 0x6F1), answered on 0x600 + targetAddress.
+    QJsonObject sendUdsRequest(qint64 txId, qint64 rxId, const QByteArray &payload, int timeoutMs,
+                               int targetAddress = -1);
+    QJsonObject testerPresentStart(qint64 id, int intervalMs, bool functional, bool suppressPositiveResponse,
+                                   int targetAddress = -1);
     QJsonObject testerPresentStop(const QString &handle);
     // A snapshot of the connection and its running tester presents, safe to
     // call from any thread: it never waits for this manager's own thread,
@@ -47,8 +53,8 @@ private:
     }
 
     QCanBusFrame waitForFrame(quint32 id, int timeoutMs, const std::function<bool(const QCanBusFrame &)> &pred = nullptr);
-    bool sendIsoTp(quint32 txId, quint32 rxId, const QByteArray &payload);
-    QByteArray receiveIsoTp(quint32 txId, quint32 rxId, int timeoutMs);
+    bool sendIsoTp(quint32 txId, quint32 rxId, const QByteArray &payload, quint8 ext);
+    QByteArray receiveIsoTp(quint32 txId, quint32 rxId, int timeoutMs, quint8 ext);
     void sendRaw(quint32 id, const QByteArray &data);
 
     QCanBusDevice *m_device = nullptr;
