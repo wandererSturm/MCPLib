@@ -446,7 +446,7 @@ QJsonObject CanListInterfacesCommand::execute(const QJsonObject &args) {
 QJsonObject CanOpenCommand::definition() const {
     return QJsonObject{
         {"name", "can_open"},
-        {"description", "Opens a CAN interface (plugin and interface from can_list_interfaces); then send requests with uds_send_request. Usual bitrate 500000. BMW over CAN (D-CAN): extendedAddressing true."},
+        {"description", "Opens a CAN interface (plugin and interface from can_list_interfaces); then send requests with can_send_request. Usual bitrate 500000. BMW over CAN (D-CAN): extendedAddressing true."},
         {"inputSchema", QJsonObject{
             {"type", "object"},
             {"properties", QJsonObject{
@@ -454,7 +454,7 @@ QJsonObject CanOpenCommand::definition() const {
                 {"interface", QJsonObject{{"type", "string"}, {"description", "interface name from can_list_interfaces for that plugin"}}},
                 {"paddingByte", QJsonObject{{"type", "integer"}, {"description", "byte to pad frames to 8 bytes, default 0x00 (some ECUs want 0xAA or 0xCC)"}}},
                 {"extendedId", QJsonObject{{"type", "boolean"}, {"description", "29-bit CAN ids. Default false; ids above 0x7FF use them anyway."}}},
-                {"extendedAddressing", QJsonObject{{"type", "boolean"}, {"description", "ISO-TP extended addressing: the first byte of every frame you send is the target ECU's address. Turn it on for BMW D-CAN (all requests go out on 0x6F1, each ECU answers on 0x600 + its address); then pass targetAddress (the ECU) in each uds_send_request. Not the same as 29-bit IDs (extendedId). Leave false for normal UDS/OBD with a txId/rxId pair per ECU (e.g. 0x7E0/0x7E8)."}}},
+                {"extendedAddressing", QJsonObject{{"type", "boolean"}, {"description", "ISO-TP extended addressing: the first byte of every frame you send is the target ECU's address. Turn it on for BMW D-CAN (all requests go out on 0x6F1, each ECU answers on 0x600 + its address); then pass targetAddress (the ECU) in each can_send_request. Not the same as 29-bit IDs (extendedId). Leave false for normal UDS/OBD with a txId/rxId pair per ECU (e.g. 0x7E0/0x7E8)."}}},
                 {"addressExtension", QJsonObject{{"type", "integer"}, {"description", "With extendedAddressing: a default target ECU address, used when a request gives no targetAddress. Optional - prefer targetAddress per request. Never 0xF1: that is the tester's own address."}}},
                 {"fd", QJsonObject{{"type", "boolean"}, {"description", "CAN FD (64-byte frames). Default false: classic CAN."}}},
                 {"bitrate", QJsonObject{{"type", "integer"}, {"description", "bit/s: 500000 for most diagnostic CAN (OBD port), 125000 or 100000 for some body buses. A wrong bitrate shows as timeouts with no traffic."}}},
@@ -507,7 +507,7 @@ QJsonObject CanGetReceivedFramesCommand::execute(const QJsonObject &args) {
 
 QJsonObject UdsSendRequestCommand::definition() const {
     return QJsonObject{
-        {"name", "uds_send_request"},
+        {"name", "can_send_request"},
         {"description", "Sends one UDS request to an ECU over CAN and returns its answer as hex, e.g. '62 F1 90 ...' (framing and 'response pending' are handled). A negative answer comes back as an error naming the NRC. Needs can_open."},
         {"inputSchema", QJsonObject{
             {"type", "object"},
@@ -536,13 +536,13 @@ QJsonObject UdsSendRequestCommand::execute(const QJsonObject &args) {
 
 QJsonObject UdsTesterPresentStartCommand::definition() const {
     return QJsonObject{
-        {"name", "uds_tester_present_start"},
-        {"description", "Keeps an ECU's diagnostic session open by sending TesterPresent every intervalMs - only needed in a non-default session (after 10 03). Returns a handle for uds_tester_present_stop."},
+        {"name", "can_tester_present_start"},
+        {"description", "Keeps an ECU's diagnostic session open by sending TesterPresent every intervalMs - only needed in a non-default session (after 10 03). Returns a handle for can_tester_present_stop."},
         {"inputSchema", QJsonObject{
             {"type", "object"},
             {"properties", QJsonObject{
-                {"id", QJsonObject{{"type", "string"}, {"description", "CAN ID to send on: the ECU's request ID (the txId of uds_send_request), or the broadcast ID (e.g. 0x7DF) for addressing=functional. With extended addressing it can be left out (0x6F1)."}}},
-                {"targetAddress", QJsonObject{{"type", "string"}, {"description", "Extended addressing (BMW D-CAN) only: the ECU to keep in its session, e.g. \"0x12\" - the same targetAddress as in uds_send_request."}}},
+                {"txId", QJsonObject{{"type", "string"}, {"description", "CAN ID to send on: the same txId as in can_send_request (e.g. 0x7E0), or the broadcast ID (0x7DF) for addressing=functional. With extended addressing it can be left out (0x6F1)."}}},
+                {"targetAddress", QJsonObject{{"type", "string"}, {"description", "Extended addressing (BMW D-CAN) only: the ECU to keep in its session, e.g. \"0x12\" - the same targetAddress as in can_send_request."}}},
                 {"addressing", QJsonObject{{"type", "string"}, {"enum", QJsonArray{"physical", "functional"}}, {"description", "default physical. functional always suppresses the response regardless of suppressPositiveResponse"}}},
                 {"intervalMs", QJsonObject{{"type", "integer"}, {"description", "default 2000, keep below the ECU's S3 timeout (usually 5000ms)"}}},
                 {"suppressPositiveResponse", QJsonObject{{"type", "boolean"}, {"description", "default true, ignored (always true) when addressing=functional"}}}
@@ -551,7 +551,9 @@ QJsonObject UdsTesterPresentStartCommand::definition() const {
     };
 }
 QJsonObject UdsTesterPresentStartCommand::execute(const QJsonObject &args) {
-    qint64 id = args.contains("id") ? qint64(udsParseId(args["id"])) : -1;
+    // "id" was this argument's name before it matched can_send_request's.
+    const QJsonValue idArg = args.contains("txId") ? args["txId"] : args["id"];
+    qint64 id = idArg.isUndefined() ? -1 : qint64(udsParseId(idArg));
     int target = args.contains("targetAddress") ? int(udsParseId(args["targetAddress"]) & 0xFF) : -1;
     int intervalMs = args.contains("intervalMs") ? args["intervalMs"].toInt() : 2000;
     bool functional = args["addressing"].toString() == "functional";
@@ -561,8 +563,8 @@ QJsonObject UdsTesterPresentStartCommand::execute(const QJsonObject &args) {
 
 QJsonObject UdsTesterPresentStopCommand::definition() const {
     return QJsonObject{
-        {"name", "uds_tester_present_stop"},
-        {"description", "Stops a tester present started with uds_tester_present_start."},
+        {"name", "can_tester_present_stop"},
+        {"description", "Stops a tester present started with can_tester_present_start."},
         {"inputSchema", QJsonObject{
             {"type", "object"},
             {"properties", QJsonObject{
