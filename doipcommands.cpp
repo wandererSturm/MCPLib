@@ -296,7 +296,7 @@ QJsonObject DoipOpenCommand::definition() const {
             {"properties", QJsonObject{
                 {"host", QJsonObject{{"type", "string"}, {"description", "the DoIP gateway's IP address or hostname (not an individual ECU's address - the gateway routes to ECUs by logical address once connected). Get this from doip_discover_vehicles if unknown."}}},
                 {"port", QJsonObject{{"type", "integer"}, {"description", "default 13400 (standard DoIP port)"}}},
-                {"sourceAddress", QJsonObject{{"type", "string"}, {"description", "this tester's own logical address, as a hex string like \"0x0E00\" or a decimal number. Default 0x0E00. Rarely needs changing unless the vehicle/tool requires a specific registered tester address."}}},
+                {"sourceAddress", QJsonObject{{"type", "string"}, {"description", "this tester's own logical address, hex, like \"0x0E00\". Default 0x0E00. Rarely needs changing unless the vehicle/tool requires a specific registered tester address."}}},
                 {"activationType", QJsonObject{{"type", "integer"}, {"description", "DoIP routing activation type, default 0x00 (default/normal activation). Some vehicles require a different value (e.g. 0x01/0x02/0xE0 for manufacturer-specific central-security or WWH-OBD activation) - consult the vehicle's DoIP spec if 0x00 is refused."}}},
                 {"timeoutMs", QJsonObject{{"type", "integer"}, {"description", "connection + routing-activation timeout, default 2000ms"}}}
             }},
@@ -346,7 +346,7 @@ QJsonObject DoipSendRequestCommand::definition() const {
         {"inputSchema", QJsonObject{
             {"type", "object"},
             {"properties", QJsonObject{
-                {"targetAddress", QJsonObject{{"type", "string"}, {"description", "the target ECU's DoIP logical address (16-bit), e.g. \"0x0010\" (hex string with 0x prefix) or a plain decimal number. This is per-ECU, unlike the connection's gateway host - the same open connection can address different ECUs by changing this on each call."}}},
+                {"targetAddress", QJsonObject{{"type", "string"}, {"description", "the target ECU's DoIP logical address (16-bit), hex, e.g. \"0x0010\". This is per-ECU, unlike the connection's gateway host - the same open connection can address different ECUs by changing this on each call."}}},
                 {"data", QJsonObject{{"type", "string"}, {"description", "The UDS request as hex bytes, e.g. \"22 F1 90\" (read the VIN); the first byte is the service ID. An array of numbers 0-255 works too. No framing or length bytes."}}},
                 {"timeoutMs", QJsonObject{{"type", "integer"}, {"description", "how long to wait for the complete response, default 2000ms"}}}
             }},

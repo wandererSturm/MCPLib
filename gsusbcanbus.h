@@ -5,6 +5,7 @@
 #include <QMutex>
 #include <QQueue>
 #include <QVector>
+#include <QElapsedTimer>
 #include "mcpserverlib_global.h"
 
 struct libusb_context;
@@ -39,6 +40,9 @@ protected:
 
 private slots:
     void onFrameBytesReceived(const QList<QByteArray> &batch);
+    void onFailed(const QString &reason);
+    void onBusEvent(bool busOff, const QString &text);
+    void onConfirmations(bool stalled, int waiting);
 
 private:
     QString m_busIdentifier;
@@ -47,6 +51,20 @@ private:
     QThread m_ioThread;
     GsUsbIoWorker *m_worker = nullptr;
     bool m_fdMode = false;
+
+    // What went wrong, said through setError() (errorOccurred): a dead or
+    // frozen adapter (ConnectionError - nothing more goes out), bus-off
+    // (restarted once, then WriteError until reopened), frames the adapter
+    // never confirms (TimeoutError).
+    static constexpr int kMaxQueued = 64;
+    void restartController();
+    void report(const QString &text, QCanBusDevice::CanBusError kind);
+    quint32 m_startFlags = 0;
+    QString m_failure;
+    bool m_busOff = false;
+    bool m_restartedOnce = false;
+    QString m_lastEvent;
+    QElapsedTimer m_lastEventAt;
 };
 
 #endif

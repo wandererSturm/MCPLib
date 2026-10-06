@@ -27,11 +27,13 @@ QString udsNrcName(quint8 nrc) {
     }
 }
 
+// A string is hex, with or without 0x ("0x640", "640", "7e0"): that's how
+// diagnostic ids and addresses are written. A JSON number is decimal.
 quint32 udsParseId(const QJsonValue &v) {
     if (v.isString()) {
-        QString s = v.toString();
-        bool hex = s.startsWith("0x") || s.startsWith("0X");
-        return s.toUInt(nullptr, hex ? 16 : 10);
+        QString s = v.toString().trimmed();
+        if (s.startsWith("0x") || s.startsWith("0X")) s = s.mid(2);
+        return s.toUInt(nullptr, 16);
     }
     return static_cast<quint32>(v.toInt());
 }

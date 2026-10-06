@@ -69,6 +69,12 @@ private:
     int m_handleCounter = 0;
 
     void publishStatus(); // on this manager's thread, after every change
+    // What the device last reported going wrong (errorOccurred), for the
+    // status and for errors; fatal (the adapter stopped working): nothing
+    // more is sent until it's opened again.
+    QString m_fault;
+    bool m_faultFatal = false;
+    QString withFault(const QString &error) const;
     QString m_plugin, m_interface;
     quint32 m_bitrate = 0, m_dataBitrate = 0;
     QMap<QString, QJsonObject> m_testerPresentInfo; // handle -> what it keeps alive

@@ -21,6 +21,10 @@ void CanManager::publishStatus() {
         s["plugin"] = m_plugin;
         s["interface"] = m_interface;
         if (m_bitrate) s["bitrate"] = qint64(m_bitrate);
+        if (!m_fault.isEmpty()) {
+            s["problem"] = m_fault;
+            s["broken"] = m_faultFatal;
+        }
         s["fd"] = m_fdMode;
         if (m_fdMode && m_dataBitrate) s["dataBitrate"] = qint64(m_dataBitrate);
         s["extendedId"] = m_forceExtendedId;
@@ -35,6 +39,11 @@ void CanManager::publishStatus() {
     s["testerPresent"] = tp;
     QMutexLocker locker(&m_statusMutex);
     m_status = s;
+}
+
+// An error, with what the adapter said meanwhile (if it said anything).
+QString CanManager::withFault(const QString &error) const {
+    return m_fault.isEmpty() ? error : error + " - the adapter reports: " + m_fault;
 }
 
 QJsonObject CanManager::status() const {
@@ -264,6 +273,15 @@ QJsonObject CanManager::open(const QString &plugin, const QString &interfaceName
         if (fdMode && dataBitrate) newDevice->setConfigurationParameter(QCanBusDevice::DataBitRateKey, dataBitrate);
 
         connect(newDevice, &QCanBusDevice::framesReceived, this, &CanManager::onFramesReceived);
+        // The adapter's own reports - a dead or frozen adapter, bus-off,
+        // frames it never confirms - instead of carrying on as if all's well.
+        connect(newDevice, &QCanBusDevice::errorOccurred, this, [this, newDevice](QCanBusDevice::CanBusError e) {
+            if (newDevice != m_device || e == QCanBusDevice::NoError)
+                return;
+            m_fault = newDevice->errorString();
+            m_faultFatal = m_faultFatal || e == QCanBusDevice::ConnectionError;
+            publishStatus();
+        });
         if (!newDevice->connectDevice()) {
             QString e = newDevice->errorString();
             delete newDevice;
@@ -275,6 +293,8 @@ QJsonObject CanManager::open(const QString &plugin, const QString &interfaceName
             delete m_device;
         }
         m_device = newDevice;
+        m_fault.clear();
+        m_faultFatal = false;
         m_padByte = padByte;
         m_forceExtendedId = forceExtendedId;
         m_extendedAddressing = extendedAddressing;
@@ -338,6 +358,10 @@ QJsonObject CanManager::sendUdsRequest(qint64 txIdIn, qint64 rxIdIn, const QByte
                                        int targetAddress) {
     return onOwnThread([this, txIdIn, rxIdIn, payload, timeoutMs, targetAddress]() -> QJsonObject {
         if (!m_device) return udsTextResult("no CAN interface open", true);
+        if (m_faultFatal)
+            return udsTextResult("the CAN adapter stopped working: " + m_fault, true);
+        m_fault.clear(); // a new request: whatever the adapter says now is about this one
+        publishStatus();
         if (targetAddress >= 0 && !m_extendedAddressing)
             return udsTextResult("targetAddress is for extended addressing (BMW D-CAN): can_open with "
                                  "extendedAddressing=true first, or address the ECU by txId/rxId alone", true);
@@ -355,16 +379,22 @@ QJsonObject CanManager::sendUdsRequest(qint64 txIdIn, qint64 rxIdIn, const QByte
             : QString("sent on 0x%1, listening on 0x%2").arg(txId, 0, 16).arg(rxId, 0, 16);
 
         if (!sendIsoTp(txId, rxId, payload, ext))
-            return udsTextResult(QString("failed to send request: no flow control from the ECU (%1)").arg(route), true);
+            return udsTextResult(withFault(QString("failed to send request: no flow control from the ECU (%1)").arg(route)), true);
 
         for (int attempt = 0; attempt < 10; ++attempt) {
             QByteArray resp = receiveIsoTp(txId, rxId, timeoutMs, ext);
-            if (resp.isEmpty())
-                return udsTextResult(QString("timeout waiting for response (%1)%2").arg(route,
-                    m_extendedAddressing ? QString("; with extended addressing the ECU answers on 0x600 + its "
-                                                   "address - check targetAddress")
-                                         : QString("; check the bitrate (can_get_received_frames shows whether "
-                                                   "the bus has traffic at all) and txId/rxId")), true);
+            if (resp.isEmpty()) {
+                // BMW: an rxId that isn't 0x600 + the ECU is the usual slip.
+                const bool bmwMismatch = m_extendedAddressing && rxIdIn >= 0 && quint32(rxIdIn) != BmwIdBase + ext;
+                const QString hint = bmwMismatch
+                    ? QString("; with extended addressing ECU 0x%1 answers on 0x%2, not 0x%3 - is rxId right?")
+                          .arg(ext, 2, 16, QChar('0')).arg(BmwIdBase + ext, 0, 16).arg(rxId, 0, 16)
+                    : m_extendedAddressing ? QString("; with extended addressing the ECU answers on 0x600 + its "
+                                                     "address - check targetAddress")
+                                           : QString("; check the bitrate (can_get_received_frames shows whether "
+                                                     "the bus has traffic at all) and txId/rxId");
+                return udsTextResult(withFault(QString("timeout waiting for response (%1)%2").arg(route, hint)), true);
+            }
             if (resp.size() >= 3 && static_cast<quint8>(resp[0]) == 0x7F) {
                 quint8 nrc = static_cast<quint8>(resp[2]);
                 if (nrc == 0x78) continue;
@@ -381,6 +411,8 @@ QJsonObject CanManager::testerPresentStart(qint64 idIn, int intervalMs, bool fun
                                            int targetAddress) {
     return onOwnThread([this, idIn, intervalMs, functional, suppressPositiveResponse, targetAddress]() -> QJsonObject {
         if (!m_device) return udsTextResult("no CAN interface open", true);
+        if (m_faultFatal)
+            return udsTextResult("the CAN adapter stopped working: " + m_fault, true);
         if (targetAddress >= 0 && !m_extendedAddressing)
             return udsTextResult("targetAddress is for extended addressing (BMW D-CAN): can_open with "
                                  "extendedAddressing=true first", true);

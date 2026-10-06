@@ -282,7 +282,7 @@ QJsonObject HsfzOpenCommand::definition() const {
             {"properties", QJsonObject{
                 {"host", QJsonObject{{"type", "string"}, {"description", "the vehicle interface's IP address or hostname, typically a 169.254.x.x link-local address when connected via an ENET cable directly (no DHCP router in between). Get this from hsfz_discover_vehicles if unknown."}}},
                 {"port", QJsonObject{{"type", "integer"}, {"description", "default 6801 (standard BMW ENET/HSFZ port)"}}},
-                {"sourceAddress", QJsonObject{{"type", "string"}, {"description", "this tester's own address, a single byte as a hex string like \"0xF4\" or a decimal number. Default 0xF4 (typical BMW tester address). Rarely needs changing."}}},
+                {"sourceAddress", QJsonObject{{"type", "string"}, {"description", "this tester's own address, one byte, hex, like \"0xF4\". Default 0xF4 (typical BMW tester address). Rarely needs changing."}}},
                 {"timeoutMs", QJsonObject{{"type", "integer"}, {"description", "connection timeout, default 2000ms"}}}
             }},
             {"required", QJsonArray{"host"}}
@@ -330,7 +330,7 @@ QJsonObject HsfzSendRequestCommand::definition() const {
         {"inputSchema", QJsonObject{
             {"type", "object"},
             {"properties", QJsonObject{
-                {"targetAddress", QJsonObject{{"type", "string"}, {"description", "the target ECU's HSFZ address, a single byte as a hex string like \"0x10\" or a decimal number (unlike DoIP's 16-bit logical address, HSFZ addresses are one byte). The same open connection can address different ECUs by changing this on each call."}}},
+                {"targetAddress", QJsonObject{{"type", "string"}, {"description", "the target ECU's HSFZ address, one byte, hex, like \"0x10\" (unlike DoIP's 16-bit logical address, HSFZ addresses are one byte). The same open connection can address different ECUs by changing this on each call."}}},
                 {"data", QJsonObject{{"type", "string"}, {"description", "The UDS request as hex bytes, e.g. \"22 F1 90\" (read the VIN); the first byte is the service ID. An array of numbers 0-255 works too. No framing or length bytes."}}},
                 {"timeoutMs", QJsonObject{{"type", "integer"}, {"description", "how long to wait for the complete response, default 2000ms"}}}
             }},

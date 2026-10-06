@@ -1,4 +1,7 @@
 #include "gsusbcanbus.h"
+#include "gsusbhealth.h"
+
+#include <QElapsedTimer>
 #include <libusb-1.0/libusb.h>
 #include <QVariant>
 #include <QMutex>
@@ -35,6 +38,8 @@ enum GsUsbBreq {
 constexpr quint32 GS_CAN_MODE_RESET = 0;
 constexpr quint32 GS_CAN_MODE_START = 1;
 constexpr quint32 GS_CAN_MODE_FD_FLAG = 0x100;
+constexpr quint32 GS_CAN_MODE_BERR_REPORTING = 1u << 12; // bus errors as error frames (if the device can)
+constexpr quint32 GS_CAN_FEATURE_BERR_REPORTING = 1u << 12;
 
 constexpr quint8 GS_CAN_FLAG_FD = 0x02;
 constexpr quint8 GS_CAN_FLAG_BRS = 0x04;
@@ -123,7 +128,7 @@ QByteArray encodeFrame(const QCanBusFrame &frame, bool fdMode) {
     QByteArray out(size, char(0));
     auto *p = reinterpret_cast<unsigned char *>(out.data());
 
-    quint32 echoId = 0; // TX: 0 is fine, we don't correlate echoes back to callers
+    quint32 echoId = 0; // set by the I/O thread when it sends: the slot its confirmation comes back under
     quint32 canId = quint32(frame.frameId());
     if (frame.hasExtendedFrameFormat()) canId = (canId & CAN_EFF_MASK) | CAN_EFF_FLAG;
     else canId &= CAN_SFF_MASK;
@@ -188,9 +193,14 @@ public:
     explicit GsUsbIoWorker(libusb_device_handle *handle) : m_handle(handle) {}
 
     void requestStop() { m_stop.storeRelease(1); }
+    void requestHealthReset() { m_resetHealth.storeRelease(1); } // the controller was restarted
     void enqueueSend(const QByteArray &bytes) {
         QMutexLocker lock(&m_txMutex);
         m_txQueue.enqueue(bytes);
+    }
+    int queued() {
+        QMutexLocker lock(&m_txMutex);
+        return int(m_txQueue.size());
     }
 
 public slots:
@@ -200,22 +210,60 @@ public slots:
     // this loop caused a busy-spin / CPU-pegging hang, most likely because
     // this device's legacy libusb-win32 backend doesn't handle libusb's
     // async transfer completion cleanly on Windows.
+    //
+    // Nothing that goes wrong is swallowed: a USB transfer that fails, a
+    // frame the adapter never confirms having put on the bus (its TX echo),
+    // and the CAN error frames it reports all come out as signals.
     void run() {
         static constexpr int kBufSize = 128; // FD frame is 76B; leaves margin
         static constexpr int kMaxBatch = 32; // caps memory/signal cost under a flood
+        static constexpr int kMaxReads = 256; // reads per round, whatever they were (error frames, echoes)
+        static constexpr int kMaxTxTimeouts = 5; // ~0.5 s of the adapter not taking frames
         unsigned char buf[kBufSize];
+        QElapsedTimer clock;
+        clock.start();
 
         while (!m_stop.loadAcquire()) {
+            if (m_resetHealth.fetchAndStoreAcquire(0))
+                m_health.reset();
+
+            // Send what the echo slots allow; the rest waits for confirmations.
             {
                 QMutexLocker lock(&m_txMutex);
                 while (!m_txQueue.isEmpty()) {
+                    const int echo = m_health.takeEchoId(clock.elapsed());
+                    if (echo < 0)
+                        break; // every slot waits for the adapter to confirm a frame
                     QByteArray bytes = m_txQueue.dequeue();
+                    const quint32 echoId = quint32(echo);
+                    std::memcpy(bytes.data(), &echoId, 4);
                     lock.unlock();
                     int transferred = 0;
-                    libusb_bulk_transfer(m_handle, GS_USB_EP_OUT,
-                                          reinterpret_cast<unsigned char *>(bytes.data()), bytes.size(),
-                                          &transferred, 100);
+                    auto *data = reinterpret_cast<unsigned char *>(bytes.data());
+                    int r = libusb_bulk_transfer(m_handle, GS_USB_EP_OUT, data, bytes.size(), &transferred, 100);
+                    if (r == LIBUSB_ERROR_PIPE) { // a stalled endpoint: clear it and try once more
+                        libusb_clear_halt(m_handle, GS_USB_EP_OUT);
+                        r = libusb_bulk_transfer(m_handle, GS_USB_EP_OUT, data, bytes.size(), &transferred, 100);
+                    }
                     lock.relock();
+                    if (r == 0 && transferred == bytes.size()) {
+                        m_txTimeouts = 0;
+                        continue;
+                    }
+                    m_health.giveBack(echoId);
+                    if (r == LIBUSB_ERROR_TIMEOUT || r == 0) {
+                        m_txQueue.prepend(bytes); // tried again next round
+                        if (++m_txTimeouts >= kMaxTxTimeouts) {
+                            lock.unlock();
+                            fail("the adapter stopped taking frames over USB (writes time out) - it seems frozen: "
+                                 "unplug it and plug it back in, then can_open again");
+                            return;
+                        }
+                        break;
+                    }
+                    lock.unlock();
+                    fail(QString("USB write failed (%1)").arg(libusb_error_name(r)) + hintFor(r));
+                    return;
                 }
             }
 
@@ -227,15 +275,69 @@ public slots:
             // queue and stalls the whole process, so frames are coalesced
             // into a bounded batch instead.
             QList<QByteArray> batch;
-            while (batch.size() < kMaxBatch) {
+            // Every read counts, not just the frames kept: a controller nobody
+            // acknowledges reports an error frame (and a TX echo can't come)
+            // on every retry - thousands a second - and a loop that only
+            // counted data frames never ended, so Stop/close never got in.
+            int reads = 0;
+            while (batch.size() < kMaxBatch && reads < kMaxReads && !m_stop.loadAcquire()) {
+                ++reads;
                 int rxlen = 0;
                 // timeout=0 means "wait forever" to libusb, so the drain
                 // reads after the first use a small nonzero timeout instead.
-                int r = libusb_bulk_transfer(m_handle, GS_USB_EP_IN, buf, kBufSize, &rxlen, batch.isEmpty() ? 50 : 1);
-                if (r != 0) break; // LIBUSB_ERROR_TIMEOUT: caught up, nothing more waiting
-                if (rxlen >= kHeaderSize)
-                    batch.append(QByteArray(reinterpret_cast<const char *>(buf), rxlen));
+                int r = libusb_bulk_transfer(m_handle, GS_USB_EP_IN, buf, kBufSize, &rxlen, reads == 1 ? 50 : 1);
+                if (r == LIBUSB_ERROR_TIMEOUT)
+                    break; // caught up, nothing more waiting
+                if (r == LIBUSB_ERROR_PIPE) {
+                    if (++m_rxStalls > 3) {
+                        fail("USB read endpoint keeps stalling" + hintFor(r));
+                        return;
+                    }
+                    libusb_clear_halt(m_handle, GS_USB_EP_IN);
+                    break;
+                }
+                if (r == LIBUSB_ERROR_OVERFLOW)
+                    break; // one oversized transfer: skip it
+                if (r != 0) {
+                    fail(QString("USB read failed (%1)").arg(libusb_error_name(r)) + hintFor(r));
+                    return;
+                }
+                m_rxStalls = 0;
+                if (rxlen < kHeaderSize)
+                    continue;
+                quint32 echoId, canId;
+                std::memcpy(&echoId, buf + 0, 4);
+                std::memcpy(&canId, buf + 4, 4);
+                if (echoId != 0xFFFFFFFFu) { // a TX confirmation: that frame is on the bus
+                    m_health.echoed(echoId);
+                    continue;
+                }
+                if (GsUsbHealth::isErrorFrame(canId)) {
+                    const QByteArray data(reinterpret_cast<const char *>(buf + kHeaderSize), qMin(8, rxlen - kHeaderSize));
+                    const GsUsbHealth::ErrorReport report = GsUsbHealth::describeErrorFrame(canId, data);
+                    // The same report again within a second isn't news (one per
+                    // retry would flood the receiving thread); bus-off always is.
+                    if (!report.text.isEmpty()
+                        && (report.busOff || report.text != m_lastBusEvent || !m_lastBusEventAt.isValid()
+                            || m_lastBusEventAt.elapsed() >= 1000)) {
+                        m_lastBusEvent = report.text;
+                        m_lastBusEventAt.start();
+                        emit busEvent(report.busOff, report.text);
+                    }
+                    continue;
+                }
+                batch.append(QByteArray(reinterpret_cast<const char *>(buf), rxlen));
             }
+
+            // Frames sent but never confirmed: they aren't getting onto the bus.
+            const bool stalled = m_health.stalled(clock.elapsed());
+            if (stalled != m_reportedStall) {
+                m_reportedStall = stalled;
+                emit confirmations(stalled, m_health.inFlight() + queued());
+            }
+
+            if (reads >= kMaxReads)
+                QThread::msleep(5); // a flood of error frames/echoes: let the rest of the round (and Stop) in
             if (batch.isEmpty()) continue;
             emit frameReceived(batch);
             // Hitting the cap means the device is sustaining a continuous
@@ -251,12 +353,32 @@ public slots:
 
 signals:
     void frameReceived(const QList<QByteArray> &batch);
+    void failed(const QString &reason);              // the adapter stopped working; this thread has ended
+    void busEvent(bool busOff, const QString &text);  // a CAN error frame worth telling
+    void confirmations(bool stalled, int waiting);    // frames stopped (or started again) being confirmed
 
 private:
+    static QString hintFor(int libusbError) {
+        if (libusbError == LIBUSB_ERROR_NO_DEVICE)
+            return " - the adapter was unplugged or reset: plug it in, then can_open again";
+        return " - the adapter stopped responding: unplug it and plug it back in, then can_open again";
+    }
+    void fail(const QString &reason) {
+        m_stop.storeRelease(1);
+        emit failed(reason);
+    }
+
     libusb_device_handle *m_handle;
     QMutex m_txMutex;
     QQueue<QByteArray> m_txQueue;
     QAtomicInt m_stop{0};
+    QAtomicInt m_resetHealth{0};
+    GsUsbHealth m_health;
+    bool m_reportedStall = false;
+    int m_txTimeouts = 0;
+    int m_rxStalls = 0;
+    QString m_lastBusEvent;
+    QElapsedTimer m_lastBusEventAt;
 };
 
 // ---------------------------------------------------------------------
@@ -415,7 +537,14 @@ bool GsUsbCanBusDevice::open() {
         }
     }
 
-    GsDeviceMode start{GS_CAN_MODE_START, m_fdMode ? GS_CAN_MODE_FD_FLAG : 0};
+    m_startFlags = m_fdMode ? GS_CAN_MODE_FD_FLAG : 0;
+    if (btc.feature & GS_CAN_FEATURE_BERR_REPORTING)
+        m_startFlags |= GS_CAN_MODE_BERR_REPORTING; // a missing ACK, bus-off etc. come back as error frames
+    m_failure.clear();
+    m_busOff = false;
+    m_restartedOnce = false;
+    m_lastEvent.clear();
+    GsDeviceMode start{GS_CAN_MODE_START, m_startFlags};
     if (ctrlOut(m_handle, GS_USB_BREQ_MODE, 0, &start, sizeof(start)) != int(sizeof(start))) {
         setError("failed to start CAN controller", QCanBusDevice::ConnectionError);
         close();
@@ -426,6 +555,9 @@ bool GsUsbCanBusDevice::open() {
     m_worker->moveToThread(&m_ioThread);
     connect(&m_ioThread, &QThread::started, m_worker, &GsUsbIoWorker::run);
     connect(m_worker, &GsUsbIoWorker::frameReceived, this, &GsUsbCanBusDevice::onFrameBytesReceived);
+    connect(m_worker, &GsUsbIoWorker::failed, this, &GsUsbCanBusDevice::onFailed);
+    connect(m_worker, &GsUsbIoWorker::busEvent, this, &GsUsbCanBusDevice::onBusEvent);
+    connect(m_worker, &GsUsbIoWorker::confirmations, this, &GsUsbCanBusDevice::onConfirmations);
     m_ioThread.start();
 
     // The base class does not transition state() to ConnectedState on its
@@ -472,12 +604,79 @@ bool GsUsbCanBusDevice::writeFrame(const QCanBusFrame &frame) {
         setError("CAN FD frame on a classic (non-FD) connection", QCanBusDevice::WriteError);
         return false;
     }
+    if (!m_failure.isEmpty()) { // the adapter stopped working: nothing goes out
+        setError(m_failure, QCanBusDevice::ConnectionError);
+        return false;
+    }
+    if (m_busOff) {
+        setError("the CAN controller is bus-off - can_close and can_open again (check the bitrate and wiring)",
+                 QCanBusDevice::WriteError);
+        return false;
+    }
+    if (m_worker->queued() >= kMaxQueued) {
+        setError(QString("the adapter isn't sending: %1 frames are waiting to go out").arg(kMaxQueued),
+                 QCanBusDevice::WriteError);
+        return false;
+    }
     m_worker->enqueueSend(encodeFrame(frame, m_fdMode));
     return true;
 }
 
 QString GsUsbCanBusDevice::interpretErrorFrame(const QCanBusFrame &errorFrame) {
     return QString::fromLatin1("gs_usb error frame: id=0x%1").arg(errorFrame.frameId(), 0, 16);
+}
+
+void GsUsbCanBusDevice::onFailed(const QString &reason) {
+    m_failure = reason;
+    setError(reason, QCanBusDevice::ConnectionError);
+}
+
+void GsUsbCanBusDevice::onBusEvent(bool busOff, const QString &text) {
+    if (busOff && !m_busOff) {
+        if (!m_restartedOnce) {
+            // The usual recovery: restart the controller - once. Twice means
+            // something on the bus is wrong, and a restart loop would hide it.
+            m_restartedOnce = true;
+            restartController();
+            report(text + " - restarted the CAN controller once; if it happens again, check the bitrate "
+                          "(500000 for diagnostics) and the wiring", QCanBusDevice::WriteError);
+        } else {
+            m_busOff = true;
+            report(text + " - again, after a restart: the bus doesn't accept this adapter's frames. Check the "
+                          "bitrate, the ignition and the wiring, then can_close and can_open",
+                   QCanBusDevice::WriteError);
+        }
+        return;
+    }
+    report(text, QCanBusDevice::WriteError);
+}
+
+void GsUsbCanBusDevice::onConfirmations(bool stalled, int waiting) {
+    if (stalled)
+        report(QString("frames aren't reaching the bus: %1 waiting over a second for the adapter's confirmation - "
+                       "nobody acknowledges them (wrong bitrate, the ECU asleep or ignition off, wiring), or the "
+                       "adapter is stuck").arg(waiting),
+               QCanBusDevice::TimeoutError);
+}
+
+void GsUsbCanBusDevice::restartController() {
+    if (!m_handle)
+        return;
+    GsDeviceMode reset{GS_CAN_MODE_RESET, 0};
+    ctrlOut(m_handle, GS_USB_BREQ_MODE, 0, &reset, sizeof(reset));
+    GsDeviceMode start{GS_CAN_MODE_START, m_startFlags};
+    ctrlOut(m_handle, GS_USB_BREQ_MODE, 0, &start, sizeof(start));
+    if (m_worker)
+        m_worker->requestHealthReset();
+}
+
+// The same text again within a second (a bus error on every frame) isn't news.
+void GsUsbCanBusDevice::report(const QString &text, QCanBusDevice::CanBusError kind) {
+    if (text == m_lastEvent && m_lastEventAt.isValid() && m_lastEventAt.elapsed() < 1000)
+        return;
+    m_lastEvent = text;
+    m_lastEventAt.start();
+    setError(text, kind);
 }
 
 void GsUsbCanBusDevice::onFrameBytesReceived(const QList<QByteArray> &batch) {

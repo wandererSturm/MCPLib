@@ -25,6 +25,7 @@ set(MCPLIB_COMMAND_SOURCES
   mcpcommand.h
   mcpcommandregistry.h mcpcommandregistry.cpp
   udsutil.h udsutil.cpp
+  gsusbhealth.h gsusbhealth.cpp
   cancommands.h cancommands.cpp
   doipcommands.h doipcommands.cpp
   hsfzcommands.h hsfzcommands.cpp
