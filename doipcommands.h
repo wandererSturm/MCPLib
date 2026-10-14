@@ -16,8 +16,20 @@ class MCPSERVERLIB_EXPORT DoipManager : public QObject {
 public:
     explicit DoipManager(QObject *parent = nullptr);
 
-    QJsonObject open(const QString &host, quint16 port, quint16 sourceAddress, quint8 activationType, int timeoutMs);
+    QJsonObject open(const QString &host, quint16 port, quint16 sourceAddress, quint8 activationType, int timeoutMs,
+                     quint8 protocolVersion = 0x02);
     QJsonObject discoverVehicles(const QString &broadcastAddress, int timeoutMs);
+
+    // Optional DoIP UDP status services (ISO 13400-2): query the entity's node
+    // type / socket counts, and its diagnostic power-mode readiness.
+    QJsonObject entityStatus(const QString &host, quint16 port, int timeoutMs);
+    QJsonObject powerMode(const QString &host, quint16 port, int timeoutMs);
+
+    // Parse helpers (static + pure, testable without a socket). Empty object if
+    // the payload is too short.
+    static QJsonObject parseVehicleAnnouncement(const QByteArray &payload); // 0x0004
+    static QJsonObject parseEntityStatus(const QByteArray &payload);        // 0x4002
+    static QJsonObject parsePowerMode(const QByteArray &payload);           // 0x4004
     QJsonObject close();
     QJsonObject getReceivedMessages(int limit);
     QJsonObject sendUdsRequest(quint16 targetAddress, const QByteArray &payload, int timeoutMs);
@@ -47,11 +59,15 @@ private:
 
     void sendMessage(quint16 type, const QByteArray &payload);
     DoipMsg waitForMessage(int timeoutMs, const std::function<bool(const DoipMsg &)> &pred = nullptr);
+    // One UDP request/response exchange with an entity (discovery, status, power mode).
+    QByteArray udpExchange(const QString &host, quint16 port, quint16 reqType, const QByteArray &reqPayload,
+                           quint16 respType, int timeoutMs, QString *error);
 
     QTcpSocket *m_socket = nullptr;
     QByteArray m_recvBuffer;
     QList<DoipMsg> m_buffer;
     quint16 m_sourceAddress = 0x0E00;
+    quint8 m_protocolVersion = 0x02; // ISO 13400-2:2012; configurable via open()
     QMap<QString, QTimer *> m_testerPresentTimers;
     int m_handleCounter = 0;
 
@@ -113,6 +129,20 @@ public:
 };
 
 class MCPSERVERLIB_EXPORT DoipTesterPresentStopCommand : public DoipCommandBase {
+public:
+    using DoipCommandBase::DoipCommandBase;
+    QJsonObject definition() const override;
+    QJsonObject execute(const QJsonObject &args) override;
+};
+
+class MCPSERVERLIB_EXPORT DoipEntityStatusCommand : public DoipCommandBase {
+public:
+    using DoipCommandBase::DoipCommandBase;
+    QJsonObject definition() const override;
+    QJsonObject execute(const QJsonObject &args) override;
+};
+
+class MCPSERVERLIB_EXPORT DoipPowerModeCommand : public DoipCommandBase {
 public:
     using DoipCommandBase::DoipCommandBase;
     QJsonObject definition() const override;

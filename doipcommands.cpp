@@ -7,10 +7,82 @@
 #include <QDeadlineTimer>
 #include <QUdpSocket>
 #include <QNetworkDatagram>
+#include <QNetworkInterface>
 #include <utility>
+
+namespace {
+// ISO 13400-2 diagnostic message negative-acknowledge codes (payload type 0x8003).
+QString doipDiagNackName(quint8 code) {
+    switch (code) {
+    case 0x02: return "invalid source address";
+    case 0x03: return "unknown target address";
+    case 0x04: return "diagnostic message too large";
+    case 0x05: return "out of memory";
+    case 0x06: return "target unreachable";
+    case 0x07: return "unknown network";
+    case 0x08: return "transport protocol error";
+    default:   return "unknown";
+    }
+}
+// Generic DoIP header negative-acknowledge codes (payload type 0x0000).
+QString doipGenericNackName(quint8 code) {
+    switch (code) {
+    case 0x00: return "incorrect pattern format";
+    case 0x01: return "unknown payload type";
+    case 0x02: return "message too large";
+    case 0x03: return "out of memory";
+    case 0x04: return "invalid payload length";
+    default:   return "unknown";
+    }
+}
+} // namespace
 
 DoipManager::DoipManager(QObject *parent) : QObject(parent) {
     publishStatus();
+}
+
+QJsonObject DoipManager::parseVehicleAnnouncement(const QByteArray &payload) {
+    if (payload.size() < 32)
+        return {};
+    QJsonObject obj{
+        {"vin", QString::fromLatin1(payload.mid(0, 17))},
+        {"logicalAddress", QString("0x%1").arg((static_cast<quint8>(payload[17]) << 8)
+                                               | static_cast<quint8>(payload[18]), 4, 16, QChar('0'))},
+        {"eid", udsHexBytes(payload.mid(19, 6))},
+        {"gid", udsHexBytes(payload.mid(25, 6))},
+    };
+    if (payload.size() > 31) {
+        const quint8 fa = static_cast<quint8>(payload[31]);
+        obj["furtherActionRequired"] = QString("0x%1").arg(fa, 2, 16, QChar('0'));
+        obj["routingActivationRequired"] = (fa != 0x00);
+    }
+    return obj;
+}
+
+QJsonObject DoipManager::parseEntityStatus(const QByteArray &payload) {
+    if (payload.size() < 3)
+        return {};
+    const quint8 nodeType = static_cast<quint8>(payload[0]);
+    QJsonObject obj{
+        {"nodeType", nodeType == 0x00 ? "gateway" : nodeType == 0x01 ? "node" : "reserved"},
+        {"maxConcurrentSockets", static_cast<quint8>(payload[1])},
+        {"currentlyOpenSockets", static_cast<quint8>(payload[2])},
+    };
+    if (payload.size() >= 7) {
+        quint32 maxData = (static_cast<quint8>(payload[3]) << 24) | (static_cast<quint8>(payload[4]) << 16)
+                        | (static_cast<quint8>(payload[5]) << 8) | static_cast<quint8>(payload[6]);
+        obj["maxDataSize"] = int(maxData);
+    }
+    return obj;
+}
+
+QJsonObject DoipManager::parsePowerMode(const QByteArray &payload) {
+    if (payload.size() < 1)
+        return {};
+    const quint8 mode = static_cast<quint8>(payload[0]);
+    return QJsonObject{{"powerMode", mode == 0x00 ? "not ready" : mode == 0x01 ? "ready"
+                                     : mode == 0x02 ? "not supported" : "reserved"},
+                       {"powerModeCode", QString("0x%1").arg(mode, 2, 16, QChar('0'))}};
 }
 
 void DoipManager::publishStatus() {
@@ -40,8 +112,8 @@ QJsonObject DoipManager::status() const {
 void DoipManager::sendMessage(quint16 type, const QByteArray &payload) {
     if (!m_socket) return;
     QByteArray header(8, char(0));
-    header[0] = char(0x02);
-    header[1] = char(0xFD);
+    header[0] = char(m_protocolVersion);
+    header[1] = char(0xFF - m_protocolVersion);
     header[2] = char((type >> 8) & 0xFF);
     header[3] = char(type & 0xFF);
     quint32 len = static_cast<quint32>(payload.size());
@@ -55,12 +127,32 @@ void DoipManager::sendMessage(quint16 type, const QByteArray &payload) {
 void DoipManager::onReadyRead() {
     m_recvBuffer += m_socket->readAll();
     while (m_recvBuffer.size() >= 8) {
+        const quint8 ver = static_cast<quint8>(m_recvBuffer[0]);
+        const quint8 inv = static_cast<quint8>(m_recvBuffer[1]);
         quint32 len = (static_cast<quint8>(m_recvBuffer[4]) << 24) | (static_cast<quint8>(m_recvBuffer[5]) << 16)
                     | (static_cast<quint8>(m_recvBuffer[6]) << 8) | static_cast<quint8>(m_recvBuffer[7]);
         if (m_recvBuffer.size() < 8 + int(len)) break;
         quint16 type = (static_cast<quint8>(m_recvBuffer[2]) << 8) | static_cast<quint8>(m_recvBuffer[3]);
         QByteArray payload = m_recvBuffer.mid(8, int(len));
         m_recvBuffer.remove(0, 8 + int(len));
+
+        // Validate the generic header: known protocol version with correct inverse
+        // byte. A foreign/malformed frame isn't treated as a DoIP message (we trust
+        // the length to resync, the common case being an accepted 0x03 peer).
+        const bool versionOk = (inv == quint8(0xFF - ver)) && (ver == 0x01 || ver == 0x02 || ver == 0x03 || ver == 0xFF);
+        if (!versionOk)
+            continue;
+
+        // Alive check request: answer immediately with our source address so the
+        // entity doesn't tear down the connection. Handled here, not buffered.
+        if (type == 0x0007) {
+            QByteArray p(2, char(0));
+            p[0] = char((m_sourceAddress >> 8) & 0xFF);
+            p[1] = char(m_sourceAddress & 0xFF);
+            sendMessage(0x0008, p);
+            continue;
+        }
+
         m_buffer.append({type, payload});
         if (m_buffer.size() > 500) m_buffer.removeFirst();
     }
@@ -89,47 +181,67 @@ DoipManager::DoipMsg DoipManager::waitForMessage(int timeoutMs, const std::funct
 
 QJsonObject DoipManager::discoverVehicles(const QString &broadcastAddress, int timeoutMs) {
     return onOwnThread([this, broadcastAddress, timeoutMs]() -> QJsonObject {
-        QUdpSocket udp;
-        if (!udp.bind(QHostAddress::AnyIPv4, 0))
-            return udsTextResult("failed to bind UDP socket: " + udp.errorString(), true);
+        QUdpSocket udp4;
+        if (!udp4.bind(QHostAddress::AnyIPv4, 0))
+            return udsTextResult("failed to bind UDP socket: " + udp4.errorString(), true);
 
-        QByteArray header(8, char(0));
-        header[0] = char(0x02);
-        header[1] = char(0xFD);
-        header[3] = char(0x01);
-        udp.writeDatagram(header, QHostAddress(broadcastAddress), 13400);
+        // Vehicle Identification Request (payload type 0x0001), empty payload.
+        QByteArray vir(8, char(0));
+        vir[0] = char(m_protocolVersion);
+        vir[1] = char(0xFF - m_protocolVersion);
+        vir[3] = char(0x01);
+        udp4.writeDatagram(vir, QHostAddress(broadcastAddress), 13400);
+
+        // IPv6: send to the link-local all-nodes multicast group on each capable
+        // interface. Best effort — failures (no IPv6, no route) are ignored.
+        QUdpSocket udp6;
+        const bool have6 = udp6.bind(QHostAddress::AnyIPv6, 0);
+        if (have6) {
+            const QHostAddress group("ff02::1");
+            for (const QNetworkInterface &iface : QNetworkInterface::allInterfaces()) {
+                if (!(iface.flags() & QNetworkInterface::IsUp) || !(iface.flags() & QNetworkInterface::CanMulticast))
+                    continue;
+                udp6.setMulticastInterface(iface);
+                udp6.writeDatagram(vir, group, 13400);
+            }
+        }
+
+        auto drain = [](QUdpSocket &sock, QJsonArray &out) {
+            while (sock.hasPendingDatagrams()) {
+                QNetworkDatagram dg = sock.receiveDatagram();
+                QByteArray data = dg.data();
+                if (data.size() < 8)
+                    continue;
+                quint16 type = (static_cast<quint8>(data[2]) << 8) | static_cast<quint8>(data[3]);
+                quint32 len = (static_cast<quint8>(data[4]) << 24) | (static_cast<quint8>(data[5]) << 16)
+                            | (static_cast<quint8>(data[6]) << 8) | static_cast<quint8>(data[7]);
+                if (type != 0x0004)
+                    continue;
+                QJsonObject v = parseVehicleAnnouncement(data.mid(8, int(len)));
+                if (v.isEmpty())
+                    continue;
+                v["ip"] = dg.senderAddress().toString();
+                out.append(v);
+            }
+        };
 
         QJsonArray found;
         QDeadlineTimer deadline(timeoutMs);
         while (!deadline.hasExpired()) {
-            if (!udp.hasPendingDatagrams()) {
-                qint64 remaining = deadline.remainingTime();
-                if (remaining <= 0) break;
-                QEventLoop loop;
-                connect(&udp, &QUdpSocket::readyRead, &loop, &QEventLoop::quit);
-                QTimer::singleShot(int(remaining), &loop, &QEventLoop::quit);
-                loop.exec();
-                if (!udp.hasPendingDatagrams()) continue;
-            }
-
-            QNetworkDatagram dg = udp.receiveDatagram();
-            QByteArray data = dg.data();
-            if (data.size() < 8) continue;
-            quint16 type = (static_cast<quint8>(data[2]) << 8) | static_cast<quint8>(data[3]);
-            quint32 len = (static_cast<quint8>(data[4]) << 24) | (static_cast<quint8>(data[5]) << 16)
-                        | (static_cast<quint8>(data[6]) << 8) | static_cast<quint8>(data[7]);
-            QByteArray payload = data.mid(8, int(len));
-            if (type != 0x0004 || payload.size() < 32) continue;
-
-            QString vin = QString::fromLatin1(payload.mid(0, 17));
-            quint16 logicalAddr = (static_cast<quint8>(payload[17]) << 8) | static_cast<quint8>(payload[18]);
-            found.append(QJsonObject{
-                {"ip", dg.senderAddress().toString()},
-                {"vin", vin},
-                {"logicalAddress", QString("0x%1").arg(logicalAddr, 4, 16, QChar('0'))},
-                {"eid", udsHexBytes(payload.mid(19, 6))},
-                {"gid", udsHexBytes(payload.mid(25, 6))}
-            });
+            drain(udp4, found);
+            if (have6)
+                drain(udp6, found);
+            qint64 remaining = deadline.remainingTime();
+            if (remaining <= 0)
+                break;
+            if (udp4.hasPendingDatagrams() || (have6 && udp6.hasPendingDatagrams()))
+                continue;
+            QEventLoop loop;
+            connect(&udp4, &QUdpSocket::readyRead, &loop, &QEventLoop::quit);
+            if (have6)
+                connect(&udp6, &QUdpSocket::readyRead, &loop, &QEventLoop::quit);
+            QTimer::singleShot(int(remaining), &loop, &QEventLoop::quit);
+            loop.exec();
         }
 
         return udsTextResult(found.isEmpty() ? "no vehicles found"
@@ -137,8 +249,84 @@ QJsonObject DoipManager::discoverVehicles(const QString &broadcastAddress, int t
     });
 }
 
-QJsonObject DoipManager::open(const QString &host, quint16 port, quint16 sourceAddress, quint8 activationType, int timeoutMs) {
-    return onOwnThread([this, host, port, sourceAddress, activationType, timeoutMs]() -> QJsonObject {
+QByteArray DoipManager::udpExchange(const QString &host, quint16 port, quint16 reqType, const QByteArray &reqPayload,
+                                    quint16 respType, int timeoutMs, QString *error) {
+    QUdpSocket udp;
+    if (!udp.bind(QHostAddress::AnyIPv4, 0)) {
+        *error = "failed to bind UDP socket: " + udp.errorString();
+        return {};
+    }
+    QByteArray hdr(8, char(0));
+    hdr[0] = char(m_protocolVersion);
+    hdr[1] = char(0xFF - m_protocolVersion);
+    hdr[2] = char((reqType >> 8) & 0xFF);
+    hdr[3] = char(reqType & 0xFF);
+    quint32 len = static_cast<quint32>(reqPayload.size());
+    hdr[4] = char((len >> 24) & 0xFF);
+    hdr[5] = char((len >> 16) & 0xFF);
+    hdr[6] = char((len >> 8) & 0xFF);
+    hdr[7] = char(len & 0xFF);
+    udp.writeDatagram(hdr + reqPayload, QHostAddress(host), port);
+
+    QDeadlineTimer deadline(timeoutMs);
+    while (!deadline.hasExpired()) {
+        while (udp.hasPendingDatagrams()) {
+            QNetworkDatagram dg = udp.receiveDatagram();
+            QByteArray data = dg.data();
+            if (data.size() < 8)
+                continue;
+            quint16 type = (static_cast<quint8>(data[2]) << 8) | static_cast<quint8>(data[3]);
+            quint32 l = (static_cast<quint8>(data[4]) << 24) | (static_cast<quint8>(data[5]) << 16)
+                      | (static_cast<quint8>(data[6]) << 8) | static_cast<quint8>(data[7]);
+            if (type == respType)
+                return data.mid(8, int(l));
+        }
+        qint64 remaining = deadline.remainingTime();
+        if (remaining <= 0)
+            break;
+        QEventLoop loop;
+        connect(&udp, &QUdpSocket::readyRead, &loop, &QEventLoop::quit);
+        QTimer::singleShot(int(remaining), &loop, &QEventLoop::quit);
+        loop.exec();
+    }
+    *error = "timeout waiting for response";
+    return {};
+}
+
+QJsonObject DoipManager::entityStatus(const QString &host, quint16 port, int timeoutMs) {
+    return onOwnThread([this, host, port, timeoutMs]() -> QJsonObject {
+        const QString h = host.isEmpty() ? m_host : host;
+        if (h.isEmpty())
+            return udsTextResult("no host: give a host, or open a connection first", true);
+        QString err;
+        QByteArray resp = udpExchange(h, port, 0x4001, {}, 0x4002, timeoutMs, &err);
+        if (!err.isEmpty())
+            return udsTextResult("DoIP entity status request: " + err, true);
+        QJsonObject o = parseEntityStatus(resp);
+        if (o.isEmpty())
+            return udsTextResult("malformed DoIP entity status response", true);
+        return udsTextResult(QString::fromUtf8(QJsonDocument(o).toJson(QJsonDocument::Compact)));
+    });
+}
+
+QJsonObject DoipManager::powerMode(const QString &host, quint16 port, int timeoutMs) {
+    return onOwnThread([this, host, port, timeoutMs]() -> QJsonObject {
+        const QString h = host.isEmpty() ? m_host : host;
+        if (h.isEmpty())
+            return udsTextResult("no host: give a host, or open a connection first", true);
+        QString err;
+        QByteArray resp = udpExchange(h, port, 0x4003, {}, 0x4004, timeoutMs, &err);
+        if (!err.isEmpty())
+            return udsTextResult("DoIP power mode request: " + err, true);
+        QJsonObject o = parsePowerMode(resp);
+        if (o.isEmpty())
+            return udsTextResult("malformed DoIP power mode response", true);
+        return udsTextResult(QString::fromUtf8(QJsonDocument(o).toJson(QJsonDocument::Compact)));
+    });
+}
+
+QJsonObject DoipManager::open(const QString &host, quint16 port, quint16 sourceAddress, quint8 activationType, int timeoutMs, quint8 protocolVersion) {
+    return onOwnThread([this, host, port, sourceAddress, activationType, timeoutMs, protocolVersion]() -> QJsonObject {
         auto *newSocket = new QTcpSocket(this);
         QEventLoop connectLoop;
         QTimer::singleShot(timeoutMs, &connectLoop, &QEventLoop::quit);
@@ -160,6 +348,7 @@ QJsonObject DoipManager::open(const QString &host, quint16 port, quint16 sourceA
         m_recvBuffer.clear();
         m_buffer.clear();
         m_sourceAddress = sourceAddress;
+        m_protocolVersion = protocolVersion;
         m_host = host;
         m_port = port;
         connect(m_socket, &QTcpSocket::readyRead, this, &DoipManager::onReadyRead);
@@ -175,10 +364,12 @@ QJsonObject DoipManager::open(const QString &host, quint16 port, quint16 sourceA
         DoipMsg resp = waitForMessage(timeoutMs, [](const DoipMsg &m) { return m.type == 0x0006; });
         if (resp.payload.size() < 5) return udsTextResult("no routing activation response", true);
         quint8 code = static_cast<quint8>(resp.payload[4]);
-        if (code != 0x10 && code != 0x11)
-            return udsTextResult(QString("routing activation refused, code 0x%1").arg(code, 2, 16, QChar('0')), true);
-
-        return udsTextResult(QString("connected to %1:%2, routing activated").arg(host).arg(port));
+        if (code == 0x10)
+            return udsTextResult(QString("connected to %1:%2, routing activated").arg(host).arg(port));
+        if (code == 0x11) // activated, but the entity requires a confirmation step
+            return udsTextResult(QString("connected to %1:%2, routing activated (code 0x11 - confirmation required; "
+                                         "some gateways need a follow-up activation)").arg(host).arg(port));
+        return udsTextResult(QString("routing activation refused, code 0x%1").arg(code, 2, 16, QChar('0')), true);
     });
 }
 
@@ -231,10 +422,30 @@ QJsonObject DoipManager::sendUdsRequest(quint16 targetAddress, const QByteArray 
         msg += payload;
         sendMessage(0x8001, msg);
 
-        waitForMessage(300, [](const DoipMsg &m) { return m.type == 0x8002 || m.type == 0x8003; });
+        // The entity acknowledges the diagnostic message first: 0x8002 positive, or
+        // 0x8003 negative (don't wait out a timeout — report why), and a generic
+        // header NACK (0x0000) can arrive instead of either.
+        DoipMsg ack = waitForMessage(300, [](const DoipMsg &m) {
+            return m.type == 0x8002 || m.type == 0x8003 || m.type == 0x0000;
+        });
+        if (ack.type == 0x8003) {
+            quint8 nack = ack.payload.size() >= 5 ? static_cast<quint8>(ack.payload[4]) : 0xFF;
+            return udsTextResult(QString("DoIP diagnostic message rejected (negative ack 0x%1: %2)")
+                .arg(nack, 2, 16, QChar('0')).arg(doipDiagNackName(nack)), true);
+        }
+        if (ack.type == 0x0000) {
+            quint8 nack = ack.payload.size() >= 1 ? static_cast<quint8>(ack.payload[0]) : 0xFF;
+            return udsTextResult(QString("DoIP generic header negative ack (0x%1: %2)")
+                .arg(nack, 2, 16, QChar('0')).arg(doipGenericNackName(nack)), true);
+        }
 
         for (int attempt = 0; attempt < 10; ++attempt) {
-            DoipMsg resp = waitForMessage(timeoutMs, [](const DoipMsg &m) { return m.type == 0x8001; });
+            DoipMsg resp = waitForMessage(timeoutMs, [](const DoipMsg &m) { return m.type == 0x8001 || m.type == 0x0000; });
+            if (resp.type == 0x0000) {
+                quint8 nack = resp.payload.size() >= 1 ? static_cast<quint8>(resp.payload[0]) : 0xFF;
+                return udsTextResult(QString("DoIP generic header negative ack (0x%1: %2)")
+                    .arg(nack, 2, 16, QChar('0')).arg(doipGenericNackName(nack)), true);
+            }
             if (resp.payload.size() < 4) return udsTextResult("timeout waiting for response", true);
             QByteArray uds = resp.payload.mid(4);
             if (uds.size() >= 3 && static_cast<quint8>(uds[0]) == 0x7F) {
@@ -298,6 +509,7 @@ QJsonObject DoipOpenCommand::definition() const {
                 {"port", QJsonObject{{"type", "integer"}, {"description", "default 13400 (standard DoIP port)"}}},
                 {"sourceAddress", QJsonObject{{"type", "string"}, {"description", "this tester's own logical address, hex, like \"0x0E00\". Default 0x0E00. Rarely needs changing unless the vehicle/tool requires a specific registered tester address."}}},
                 {"activationType", QJsonObject{{"type", "integer"}, {"description", "DoIP routing activation type, default 0x00 (default/normal activation). Some vehicles require a different value (e.g. 0x01/0x02/0xE0 for manufacturer-specific central-security or WWH-OBD activation) - consult the vehicle's DoIP spec if 0x00 is refused."}}},
+                {"protocolVersion", QJsonObject{{"type", "integer"}, {"description", "DoIP protocol version byte, default 2 (ISO 13400-2:2012). Use 3 for 2019 entities that require it; only change if the gateway rejects the default."}}},
                 {"timeoutMs", QJsonObject{{"type", "integer"}, {"description", "connection + routing-activation timeout, default 2000ms"}}}
             }},
             {"required", QJsonArray{"host"}}
@@ -308,8 +520,9 @@ QJsonObject DoipOpenCommand::execute(const QJsonObject &args) {
     quint16 port = args.contains("port") ? static_cast<quint16>(args["port"].toInt()) : 13400;
     quint16 srcAddr = args.contains("sourceAddress") ? static_cast<quint16>(udsParseId(args["sourceAddress"])) : 0x0E00;
     quint8 activationType = args.contains("activationType") ? static_cast<quint8>(args["activationType"].toInt()) : 0x00;
+    quint8 protocolVersion = args.contains("protocolVersion") ? static_cast<quint8>(args["protocolVersion"].toInt()) : 0x02;
     int timeoutMs = args.contains("timeoutMs") ? args["timeoutMs"].toInt() : 2000;
-    return m_manager->open(args["host"].toString(), port, srcAddr, activationType, timeoutMs);
+    return m_manager->open(args["host"].toString(), port, srcAddr, activationType, timeoutMs, protocolVersion);
 }
 
 QJsonObject DoipCloseCommand::definition() const {
@@ -401,6 +614,48 @@ QJsonObject DoipTesterPresentStopCommand::definition() const {
 }
 QJsonObject DoipTesterPresentStopCommand::execute(const QJsonObject &args) {
     return m_manager->testerPresentStop(args["handle"].toString());
+}
+
+QJsonObject DoipEntityStatusCommand::definition() const {
+    return QJsonObject{
+        {"name", "doip_entity_status"},
+        {"description", "Asks a DoIP entity (gateway) for its status over UDP: node type, max concurrent sockets, currently open sockets, and max data size. Uses the open connection's host if none is given."},
+        {"inputSchema", QJsonObject{
+            {"type", "object"},
+            {"properties", QJsonObject{
+                {"host", QJsonObject{{"type", "string"}, {"description", "the DoIP entity's IP (default: the currently open connection's host)"}}},
+                {"port", QJsonObject{{"type", "integer"}, {"description", "default 13400"}}},
+                {"timeoutMs", QJsonObject{{"type", "integer"}, {"description", "default 2000"}}}
+            }}
+        }}
+    };
+}
+QJsonObject DoipEntityStatusCommand::execute(const QJsonObject &args) {
+    QString host = args.contains("host") ? args["host"].toString() : QString();
+    quint16 port = args.contains("port") ? static_cast<quint16>(args["port"].toInt()) : 13400;
+    int timeoutMs = args.contains("timeoutMs") ? args["timeoutMs"].toInt() : 2000;
+    return m_manager->entityStatus(host, port, timeoutMs);
+}
+
+QJsonObject DoipPowerModeCommand::definition() const {
+    return QJsonObject{
+        {"name", "doip_power_mode"},
+        {"description", "Asks a DoIP entity over UDP whether the vehicle is in a diagnostic-capable power mode (ready / not ready / not supported). Uses the open connection's host if none is given."},
+        {"inputSchema", QJsonObject{
+            {"type", "object"},
+            {"properties", QJsonObject{
+                {"host", QJsonObject{{"type", "string"}, {"description", "the DoIP entity's IP (default: the currently open connection's host)"}}},
+                {"port", QJsonObject{{"type", "integer"}, {"description", "default 13400"}}},
+                {"timeoutMs", QJsonObject{{"type", "integer"}, {"description", "default 2000"}}}
+            }}
+        }}
+    };
+}
+QJsonObject DoipPowerModeCommand::execute(const QJsonObject &args) {
+    QString host = args.contains("host") ? args["host"].toString() : QString();
+    quint16 port = args.contains("port") ? static_cast<quint16>(args["port"].toInt()) : 13400;
+    int timeoutMs = args.contains("timeoutMs") ? args["timeoutMs"].toInt() : 2000;
+    return m_manager->powerMode(host, port, timeoutMs);
 }
 
 QJsonObject DoipDiscoverVehiclesCommand::definition() const {
