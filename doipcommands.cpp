@@ -508,8 +508,8 @@ QJsonObject DoipOpenCommand::definition() const {
                 {"host", QJsonObject{{"type", "string"}, {"description", "the DoIP gateway's IP address or hostname (not an individual ECU's address - the gateway routes to ECUs by logical address once connected). Get this from doip_discover_vehicles if unknown."}}},
                 {"port", QJsonObject{{"type", "integer"}, {"description", "default 13400 (standard DoIP port)"}}},
                 {"sourceAddress", QJsonObject{{"type", "string"}, {"description", "this tester's own logical address, hex, like \"0x0E00\". Default 0x0E00. Rarely needs changing unless the vehicle/tool requires a specific registered tester address."}}},
-                {"activationType", QJsonObject{{"type", "integer"}, {"description", "DoIP routing activation type, default 0x00 (default/normal activation). Some vehicles require a different value (e.g. 0x01/0x02/0xE0 for manufacturer-specific central-security or WWH-OBD activation) - consult the vehicle's DoIP spec if 0x00 is refused."}}},
-                {"protocolVersion", QJsonObject{{"type", "integer"}, {"description", "DoIP protocol version byte, default 2 (ISO 13400-2:2012). Use 3 for 2019 entities that require it; only change if the gateway rejects the default."}}},
+                {"activationType", QJsonObject{{"type", "integer"}, {"description", "routing activation type as a number, default 0 (normal activation). Some vehicles need another value (manufacturer-specific, e.g. 1, 2 or 224) - consult the vehicle's DoIP spec if 0 is refused."}}},
+                {"protocolVersion", QJsonObject{{"type", "integer"}, {"enum", QJsonArray{2, 3}}, {"description", "DoIP protocol version, default 2 (ISO 13400-2:2012). Use 3 only for 2019 entities that reject 2."}}},
                 {"timeoutMs", QJsonObject{{"type", "integer"}, {"description", "connection + routing-activation timeout, default 2000ms"}}}
             }},
             {"required", QJsonArray{"host"}}
@@ -619,13 +619,13 @@ QJsonObject DoipTesterPresentStopCommand::execute(const QJsonObject &args) {
 QJsonObject DoipEntityStatusCommand::definition() const {
     return QJsonObject{
         {"name", "doip_entity_status"},
-        {"description", "Asks a DoIP entity (gateway) for its status over UDP: node type, max concurrent sockets, currently open sockets, and max data size. Uses the open connection's host if none is given."},
+        {"description", "Optional, rarely needed: asks the DoIP gateway over UDP how many diagnostic connections it allows and has open (and its node type). Use only to investigate connection-limit problems, not for normal requests. Uses the open connection's host if none is given."},
         {"inputSchema", QJsonObject{
             {"type", "object"},
             {"properties", QJsonObject{
                 {"host", QJsonObject{{"type", "string"}, {"description", "the DoIP entity's IP (default: the currently open connection's host)"}}},
                 {"port", QJsonObject{{"type", "integer"}, {"description", "default 13400"}}},
-                {"timeoutMs", QJsonObject{{"type", "integer"}, {"description", "default 2000"}}}
+                {"timeoutMs", QJsonObject{{"type", "integer"}, {"description", "default 2000ms"}}}
             }}
         }}
     };
@@ -640,13 +640,13 @@ QJsonObject DoipEntityStatusCommand::execute(const QJsonObject &args) {
 QJsonObject DoipPowerModeCommand::definition() const {
     return QJsonObject{
         {"name", "doip_power_mode"},
-        {"description", "Asks a DoIP entity over UDP whether the vehicle is in a diagnostic-capable power mode (ready / not ready / not supported). Uses the open connection's host if none is given."},
+        {"description", "Optional, rarely needed: asks over UDP whether the vehicle is powered up enough for diagnostics (ready / not ready / not supported). Use only if requests fail because the vehicle may be asleep. Uses the open connection's host if none is given."},
         {"inputSchema", QJsonObject{
             {"type", "object"},
             {"properties", QJsonObject{
                 {"host", QJsonObject{{"type", "string"}, {"description", "the DoIP entity's IP (default: the currently open connection's host)"}}},
                 {"port", QJsonObject{{"type", "integer"}, {"description", "default 13400"}}},
-                {"timeoutMs", QJsonObject{{"type", "integer"}, {"description", "default 2000"}}}
+                {"timeoutMs", QJsonObject{{"type", "integer"}, {"description", "default 2000ms"}}}
             }}
         }}
     };
