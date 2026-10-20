@@ -6,6 +6,7 @@
 #include <QEventLoop>
 #include <QTimer>
 #include <QDeadlineTimer>
+#include <memory>
 #include <utility>
 #ifdef MCPSERVERLIB_HAVE_GSUSB
 #include "gsusbcanbus.h"
@@ -37,6 +38,13 @@ void CanManager::publishStatus() {
         tp.append(info);
     }
     s["testerPresent"] = tp;
+    QJsonArray tx;
+    for (auto it = m_periodicTxInfo.cbegin(); it != m_periodicTxInfo.cend(); ++it) {
+        QJsonObject info = it.value();
+        info["handle"] = it.key();
+        tx.append(info);
+    }
+    s["periodicSend"] = tx;
     QMutexLocker locker(&m_statusMutex);
     m_status = s;
 }
@@ -85,6 +93,17 @@ void CanManager::sendRaw(quint32 id, const QByteArray &data) {
         if (m_fdBitrateSwitch) frame.setBitrateSwitch(true);
     }
     m_device->writeFrame(frame);
+}
+
+bool CanManager::writeFrameWith(quint32 id, const QByteArray &data, bool extended, bool fd, bool brs) {
+    if (!m_device) return false;
+    QCanBusFrame frame(id, data);
+    frame.setExtendedFrameFormat(extended);
+    if (fd) {
+        frame.setFlexibleDataRateFormat(true);
+        if (brs) frame.setBitrateSwitch(true);
+    }
+    return m_device->writeFrame(frame);
 }
 
 // Valid CAN FD payload lengths (ISO 11898-1); classic CAN only ever uses 8.
@@ -318,6 +337,12 @@ QJsonObject CanManager::close() {
         }
         m_testerPresentTimers.clear();
         m_testerPresentInfo.clear();
+        for (auto *t : std::as_const(m_periodicTxTimers)) {
+            t->stop();
+            t->deleteLater();
+        }
+        m_periodicTxTimers.clear();
+        m_periodicTxInfo.clear();
         if (!m_device) {
             publishStatus();
             return udsTextResult("already closed");
@@ -454,6 +479,95 @@ QJsonObject CanManager::testerPresentStop(const QString &handle) {
         it.value()->deleteLater();
         m_testerPresentTimers.erase(it);
         m_testerPresentInfo.remove(handle);
+        publishStatus();
+        return udsTextResult("stopped");
+    });
+}
+
+// Raw frame limits. A floor on the period and a cap on concurrent loops keep a mistaken call (e.g. a
+// small model asking for intervalMs=1) from flooding a live bus.
+static constexpr int MinPeriodicIntervalMs = 5;
+static constexpr int MaxPeriodicTx = 16;
+
+static QString frameLabel(quint32 id, bool extended) {
+    return QStringLiteral("0x%1").arg(id, extended ? 8 : 3, 16, QChar('0')).toUpper().replace("0X", "0x");
+}
+
+// Empty string = ok; otherwise a plain-English reason naming the fix.
+static QString validateFrame(qint64 id, const QByteArray &data, bool extended, bool fd) {
+    if (id < 0) return QStringLiteral("id is required (e.g. \"7DF\" or \"0x18DAF110\")");
+    const quint32 uid = quint32(id);
+    if (!extended && uid > 0x7FF)
+        return QStringLiteral("id 0x%1 needs a 29-bit frame: add extended=true (11-bit max is 0x7FF)")
+            .arg(uid, 0, 16);
+    if (uid > 0x1FFFFFFF) return QStringLiteral("id out of range (max 0x1FFFFFFF for a 29-bit frame)");
+    const int max = fd ? 64 : 8;
+    if (data.size() > max)
+        return QStringLiteral("data is %1 bytes; classic CAN holds at most 8 (set fd=true for up to 64)")
+            .arg(data.size());
+    return QString();
+}
+
+QJsonObject CanManager::sendFrame(qint64 id, const QByteArray &data, bool extended, bool fd, bool brs) {
+    return onOwnThread([this, id, data, extended, fd, brs]() -> QJsonObject {
+        if (!m_device) return udsTextResult("no CAN interface open (can_open first)", true);
+        if (m_faultFatal) return udsTextResult("the CAN adapter stopped working: " + m_fault, true);
+        const QString bad = validateFrame(id, data, extended, fd);
+        if (!bad.isEmpty()) return udsTextResult(bad, true);
+        if (!writeFrameWith(quint32(id), data, extended, fd, brs))
+            return udsTextResult(withFault("the frame could not be sent"), true);
+        return udsTextResult(QStringLiteral("sent %1 # %2").arg(
+            frameLabel(quint32(id), extended), data.isEmpty() ? QStringLiteral("(no data)") : udsHexBytes(data)));
+    });
+}
+
+QJsonObject CanManager::sendPeriodicStart(qint64 id, const QByteArray &data, int intervalMs, int count,
+                                          bool extended, bool fd, bool brs) {
+    return onOwnThread([this, id, data, intervalMs, count, extended, fd, brs]() -> QJsonObject {
+        if (!m_device) return udsTextResult("no CAN interface open (can_open first)", true);
+        if (m_faultFatal) return udsTextResult("the CAN adapter stopped working: " + m_fault, true);
+        const QString bad = validateFrame(id, data, extended, fd);
+        if (!bad.isEmpty()) return udsTextResult(bad, true);
+        if (intervalMs < MinPeriodicIntervalMs)
+            return udsTextResult(QStringLiteral("intervalMs must be at least %1").arg(MinPeriodicIntervalMs), true);
+        if (m_periodicTxTimers.size() >= MaxPeriodicTx)
+            return udsTextResult(QStringLiteral("too many periodic sends running (max %1); stop one with "
+                                                "can_send_periodic_stop first").arg(MaxPeriodicTx), true);
+        const quint32 uid = quint32(id);
+        const QString handle = QStringLiteral("tx_%1").arg(++m_handleCounter);
+        auto remaining = std::make_shared<int>(count);  // 0 = run until stopped
+        auto *timer = new QTimer(this);
+        connect(timer, &QTimer::timeout, this, [this, uid, data, extended, fd, brs, handle, remaining, timer]() {
+            writeFrameWith(uid, data, extended, fd, brs);
+            if (*remaining > 0 && --*remaining == 0) {
+                timer->stop();
+                timer->deleteLater();
+                m_periodicTxTimers.remove(handle);
+                m_periodicTxInfo.remove(handle);
+                publishStatus();
+            }
+        });
+        timer->start(intervalMs);
+        m_periodicTxTimers.insert(handle, timer);
+        QJsonObject info{{"id", frameLabel(uid, extended)},
+                         {"data", udsHexBytes(data)},
+                         {"intervalMs", intervalMs}};
+        if (count > 0) info["count"] = count;
+        if (fd) info["fd"] = true;
+        m_periodicTxInfo.insert(handle, info);
+        publishStatus();
+        return udsTextResult(handle);
+    });
+}
+
+QJsonObject CanManager::sendPeriodicStop(const QString &handle) {
+    return onOwnThread([this, handle]() -> QJsonObject {
+        auto it = m_periodicTxTimers.find(handle);
+        if (it == m_periodicTxTimers.end()) return udsTextResult("no such handle", true);
+        it.value()->stop();
+        it.value()->deleteLater();
+        m_periodicTxTimers.erase(it);
+        m_periodicTxInfo.remove(handle);
         publishStatus();
         return udsTextResult("stopped");
     });
@@ -608,4 +722,104 @@ QJsonObject UdsTesterPresentStopCommand::definition() const {
 }
 QJsonObject UdsTesterPresentStopCommand::execute(const QJsonObject &args) {
     return m_manager->testerPresentStop(args["handle"].toString());
+}
+
+// --- raw CAN send (single + periodic) ----------------------------------------------
+
+static QJsonObject idProp() {
+    return QJsonObject{{"type", "string"},
+                       {"description", "CAN ID in hex, e.g. \"7DF\", \"0x7E0\" or \"18DAF110\". "
+                                       "29-bit is auto-detected when it is above 0x7FF."}};
+}
+static QJsonObject dataProp() {
+    return QJsonObject{{"type", "string"},
+                       {"description", "frame bytes in hex, e.g. \"02 01 0D\" or \"02010D\" (0-8 bytes, "
+                                       "or up to 64 with fd=true)"}};
+}
+static QJsonObject flagProp(const QString &desc) {
+    return QJsonObject{{"type", "boolean"}, {"description", desc}};
+}
+
+QJsonObject CanSendFrameCommand::definition() const {
+    return QJsonObject{
+        {"name", "can_send_frame"},
+        {"description", "Sends one raw CAN frame: exactly the bytes you give, on the ID you give, with "
+                        "no UDS/ISO-TP framing. Fire-and-forget - read any reply with "
+                        "can_get_received_frames. Example: can_send_frame(id:\"7DF\", data:\"02 01 0D\")."},
+        {"inputSchema", QJsonObject{
+            {"type", "object"},
+            {"properties", QJsonObject{
+                {"id", idProp()},
+                {"data", dataProp()},
+                {"extended", flagProp("force a 29-bit ID (default: auto from the ID)")},
+                {"fd", flagProp("send as CAN FD, up to 64 bytes (default false)")},
+                {"brs", flagProp("CAN FD bit-rate switch for the data phase (default false, needs fd)")}
+            }},
+            {"required", QJsonArray{"id"}}
+        }}
+    };
+}
+QJsonObject CanSendFrameCommand::execute(const QJsonObject &args) {
+    if (!args.contains("id")) return udsTextResult("id is required (e.g. \"7DF\")", true);
+    QString err;
+    QByteArray data = args.contains("data") ? udsParseBytes(args["data"], &err) : QByteArray();
+    if (!err.isEmpty()) return udsTextResult(err, true);
+    qint64 id = qint64(udsParseId(args["id"]));
+    bool extended = args.contains("extended") ? args["extended"].toBool() : (id > 0x7FF);
+    return m_manager->sendFrame(id, data, extended, args["fd"].toBool(), args["brs"].toBool());
+}
+
+QJsonObject CanSendPeriodicStartCommand::definition() const {
+    return QJsonObject{
+        {"name", "can_send_periodic_start"},
+        {"description", "Starts sending a raw CAN frame repeatedly (cyclic), every intervalMs. Returns a "
+                        "handle for can_send_periodic_stop. Give count to send a fixed number then stop "
+                        "on its own. Example: can_send_periodic_start(id:\"0x200\", data:\"00 00\", "
+                        "intervalMs:100)."},
+        {"inputSchema", QJsonObject{
+            {"type", "object"},
+            {"properties", QJsonObject{
+                {"id", idProp()},
+                {"data", dataProp()},
+                {"intervalMs", QJsonObject{{"type", "integer"},
+                    {"description", "period between frames in ms (default 100, minimum 5)"}}},
+                {"count", QJsonObject{{"type", "integer"},
+                    {"description", "stop automatically after this many frames (default 0 = until stopped)"}}},
+                {"extended", flagProp("force a 29-bit ID (default: auto from the ID)")},
+                {"fd", flagProp("send as CAN FD, up to 64 bytes (default false)")},
+                {"brs", flagProp("CAN FD bit-rate switch for the data phase (default false, needs fd)")}
+            }},
+            {"required", QJsonArray{"id", "data"}}
+        }}
+    };
+}
+QJsonObject CanSendPeriodicStartCommand::execute(const QJsonObject &args) {
+    if (!args.contains("id")) return udsTextResult("id is required (e.g. \"0x200\")", true);
+    QString err;
+    QByteArray data = udsParseBytes(args["data"], &err);
+    if (!err.isEmpty()) return udsTextResult(err, true);
+    qint64 id = qint64(udsParseId(args["id"]));
+    int intervalMs = args.contains("intervalMs") ? args["intervalMs"].toInt() : 100;
+    int count = args.contains("count") ? args["count"].toInt() : 0;
+    bool extended = args.contains("extended") ? args["extended"].toBool() : (id > 0x7FF);
+    return m_manager->sendPeriodicStart(id, data, intervalMs, count, extended,
+                                        args["fd"].toBool(), args["brs"].toBool());
+}
+
+QJsonObject CanSendPeriodicStopCommand::definition() const {
+    return QJsonObject{
+        {"name", "can_send_periodic_stop"},
+        {"description", "Stops a periodic raw send started with can_send_periodic_start."},
+        {"inputSchema", QJsonObject{
+            {"type", "object"},
+            {"properties", QJsonObject{
+                {"handle", QJsonObject{{"type", "string"},
+                    {"description", "the handle the matching _start call returned, e.g. \"tx_1\""}}}
+            }},
+            {"required", QJsonArray{"handle"}}
+        }}
+    };
+}
+QJsonObject CanSendPeriodicStopCommand::execute(const QJsonObject &args) {
+    return m_manager->sendPeriodicStop(args["handle"].toString());
 }

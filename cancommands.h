@@ -32,6 +32,13 @@ public:
     QJsonObject testerPresentStart(qint64 id, int intervalMs, bool functional, bool suppressPositiveResponse,
                                    int targetAddress = -1);
     QJsonObject testerPresentStop(const QString &handle);
+    // Raw CAN frame transmission: exactly the bytes given on the given ID, no ISO-TP/UDS framing.
+    // Fire-and-forget (any reply shows up via getReceivedFrames). sendPeriodicStart repeats it every
+    // intervalMs (count>0 auto-stops after N sends; 0 = until stop/close) and returns a handle.
+    QJsonObject sendFrame(qint64 id, const QByteArray &data, bool extended, bool fd, bool brs);
+    QJsonObject sendPeriodicStart(qint64 id, const QByteArray &data, int intervalMs, int count,
+                                  bool extended, bool fd, bool brs);
+    QJsonObject sendPeriodicStop(const QString &handle);
     // A snapshot of the connection and its running tester presents, safe to
     // call from any thread: it never waits for this manager's own thread,
     // which may be busy in a request.
@@ -56,6 +63,8 @@ private:
     bool sendIsoTp(quint32 txId, quint32 rxId, const QByteArray &payload, quint8 ext);
     QByteArray receiveIsoTp(quint32 txId, quint32 rxId, int timeoutMs, quint8 ext);
     void sendRaw(quint32 id, const QByteArray &data);
+    // Build and write one frame with explicit per-frame flags (raw send + periodic timer use this).
+    bool writeFrameWith(quint32 id, const QByteArray &data, bool extended, bool fd, bool brs);
 
     QCanBusDevice *m_device = nullptr;
     quint8 m_padByte = 0x00;
@@ -66,6 +75,8 @@ private:
     bool m_fdBitrateSwitch = false;
     QList<QCanBusFrame> m_buffer;
     QMap<QString, QTimer *> m_testerPresentTimers;
+    QMap<QString, QTimer *> m_periodicTxTimers;      // raw periodic sends: handle "tx_N" -> timer
+    QMap<QString, QJsonObject> m_periodicTxInfo;     // handle -> what it keeps sending (for status)
     int m_handleCounter = 0;
 
     void publishStatus(); // on this manager's thread, after every change
@@ -132,6 +143,27 @@ public:
 };
 
 class MCPSERVERLIB_EXPORT UdsTesterPresentStopCommand : public CanCommandBase {
+public:
+    using CanCommandBase::CanCommandBase;
+    QJsonObject definition() const override;
+    QJsonObject execute(const QJsonObject &args) override;
+};
+
+class MCPSERVERLIB_EXPORT CanSendFrameCommand : public CanCommandBase {
+public:
+    using CanCommandBase::CanCommandBase;
+    QJsonObject definition() const override;
+    QJsonObject execute(const QJsonObject &args) override;
+};
+
+class MCPSERVERLIB_EXPORT CanSendPeriodicStartCommand : public CanCommandBase {
+public:
+    using CanCommandBase::CanCommandBase;
+    QJsonObject definition() const override;
+    QJsonObject execute(const QJsonObject &args) override;
+};
+
+class MCPSERVERLIB_EXPORT CanSendPeriodicStopCommand : public CanCommandBase {
 public:
     using CanCommandBase::CanCommandBase;
     QJsonObject definition() const override;
