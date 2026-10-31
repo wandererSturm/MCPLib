@@ -122,6 +122,7 @@ void DoipManager::sendMessage(quint16 type, const QByteArray &payload) {
     header[6] = char((len >> 8) & 0xFF);
     header[7] = char(len & 0xFF);
     m_socket->write(header + payload);
+    emit wireMessage(true, type, payload);
 }
 
 void DoipManager::onReadyRead() {
@@ -142,6 +143,8 @@ void DoipManager::onReadyRead() {
         const bool versionOk = (inv == quint8(0xFF - ver)) && (ver == 0x01 || ver == 0x02 || ver == 0x03 || ver == 0xFF);
         if (!versionOk)
             continue;
+
+        emit wireMessage(false, type, payload);
 
         // Alive check request: answer immediately with our source address so the
         // entity doesn't tear down the connection. Handled here, not buffered.

@@ -60,8 +60,12 @@ QJsonObject CanManager::status() const {
 }
 
 void CanManager::onFramesReceived() {
-    while (m_device && m_device->framesAvailable())
-        m_buffer.append(m_device->readFrame());
+    while (m_device && m_device->framesAvailable()) {
+        QCanBusFrame f = m_device->readFrame();
+        m_buffer.append(f);
+        emit wireFrame(false, f.frameId(), f.payload(), f.hasExtendedFrameFormat(),
+                       f.hasFlexibleDataRateFormat(), f.hasBitrateSwitch());
+    }
     if (m_buffer.size() > 500)
         m_buffer.erase(m_buffer.begin(), m_buffer.begin() + (m_buffer.size() - 500));
     emit frameAppended();
@@ -93,6 +97,8 @@ void CanManager::sendRaw(quint32 id, const QByteArray &data) {
         if (m_fdBitrateSwitch) frame.setBitrateSwitch(true);
     }
     m_device->writeFrame(frame);
+    emit wireFrame(true, frame.frameId(), frame.payload(), frame.hasExtendedFrameFormat(),
+                   frame.hasFlexibleDataRateFormat(), frame.hasBitrateSwitch());
 }
 
 bool CanManager::writeFrameWith(quint32 id, const QByteArray &data, bool extended, bool fd, bool brs) {
@@ -103,7 +109,10 @@ bool CanManager::writeFrameWith(quint32 id, const QByteArray &data, bool extende
         frame.setFlexibleDataRateFormat(true);
         if (brs) frame.setBitrateSwitch(true);
     }
-    return m_device->writeFrame(frame);
+    const bool ok = m_device->writeFrame(frame);
+    if (ok)
+        emit wireFrame(true, id, data, extended, fd, brs);
+    return ok;
 }
 
 // Valid CAN FD payload lengths (ISO 11898-1); classic CAN only ever uses 8.
