@@ -31,6 +31,9 @@ public:
 
 signals:
     void messageAppended();
+    // Every HSFZ message sent/received, for the traffic trace (tx=true is
+    // outgoing).
+    void wireMessage(bool tx, quint8 source, quint8 target, quint8 type, const QByteArray &payload);
 
 private slots:
     void onReadyRead();

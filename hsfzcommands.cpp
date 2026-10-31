@@ -52,6 +52,7 @@ void HsfzManager::sendMessage(quint8 target, quint8 type, const QByteArray &payl
     frame += char(type);
     frame += payload;
     m_socket->write(frame);
+    emit wireMessage(true, m_sourceAddress, target, type, payload);
 }
 
 void HsfzManager::onReadyRead() {
@@ -66,6 +67,7 @@ void HsfzManager::onReadyRead() {
         QByteArray payload = m_recvBuffer.mid(7, int(len) - 3);
         m_recvBuffer.remove(0, 4 + int(len));
         m_buffer.append({source, target, type, payload});
+        emit wireMessage(false, source, target, type, payload);
         if (m_buffer.size() > 500) m_buffer.removeFirst();
     }
     emit messageAppended();

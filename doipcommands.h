@@ -42,6 +42,9 @@ public:
 
 signals:
     void messageAppended();
+    // Every DoIP message sent/received, for the traffic trace (tx=true is
+    // outgoing). payload is the generic-header payload, type its 16-bit kind.
+    void wireMessage(bool tx, quint16 type, const QByteArray &payload);
 
 private slots:
     void onReadyRead();

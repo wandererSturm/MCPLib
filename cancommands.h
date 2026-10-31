@@ -46,6 +46,10 @@ public:
 
 signals:
     void frameAppended();
+    // Every CAN frame this manager puts on or takes off the wire, for the
+    // traffic trace. tx=true is outgoing. Carries only primitive/QByteArray
+    // types so no metatype registration is needed.
+    void wireFrame(bool tx, quint32 id, const QByteArray &data, bool extended, bool fd, bool brs);
 
 private slots:
     void onFramesReceived();
